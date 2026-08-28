@@ -2,7 +2,7 @@ name: Recursive benchmark report
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "recursive-benchmarks"]
     paths:
       - "doc/recursive-benchmark-results.html"
       - ".github/workflows/pages.yml"
