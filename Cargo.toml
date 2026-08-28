@@ -45,6 +45,7 @@ zk_alloc = { path = "crates/zk_alloc" }
 parallel = { path = "crates/parallel" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 bincode = "1"
 rand = "0.9"
 tracing = "0.1.26"

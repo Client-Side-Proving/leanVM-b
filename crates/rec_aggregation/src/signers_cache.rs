@@ -172,14 +172,14 @@ fn generate_range(start: usize, end: usize) -> Vec<CachedSignature> {
     let mut out = Vec::with_capacity(total);
     for (done, index) in (start..end).enumerate() {
         out.push(compute_signer(index));
-        print!(
+        eprint!(
             "\r  generating XMSS signers (one-time, then cached): {}/{}",
             pretty_integer(done + 1),
             pretty_integer(total)
         );
-        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
     }
-    println!(
+    eprintln!(
         "\r  generated {} XMSS in {} s (cached to disk)                ",
         pretty_integer(total),
         pretty_f64(t.elapsed().as_secs_f64())

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "workload": {
+    "adapter": "xmss",
+    "adapter_schema_version": 1,
+    "adapter_config": {
+      "signatures_per_child": 1,
+      "signer_relationship": "disjoint"
+    },
+    "leaf_log_inv_rates": [2, 3],
+    "proof_source": {
+      "kind": "generated"
+    }
+  },
+  "arrivals": {
+    "kind": "fixed_interval",
+    "seed": 7,
+    "phases": [],
+    "sources": []
+  },
+  "root_policy": {
+    "kind": "timeout",
+    "timeout_seconds": 5,
+    "max_inputs": 16
+  },
+  "root_lifecycle": "independent",
+  "deadlines": {
+    "boundary": "serialized",
+    "p99_input_to_root_seconds": 100,
+    "max_root_interval_seconds": 100
+  },
+  "hardware_limits": {
+    "performance_workers": 2,
+    "efficiency_workers": 0,
+    "proving_processes": 1,
+    "prover_ram_bytes": 42949672960
+  },
+  "network": {
+    "connected_peers": 100,
+    "remote_input_fraction": 1,
+    "root_proof_recipients": 100,
+    "intermediate_proof_recipients": 0,
+    "ingress_budget_bytes_per_second": 1000000000,
+    "egress_budget_bytes_per_second": 1000000000,
+    "rolling_window_seconds": 1
+  },
+  "search": {
+    "arities": [2, 3, 4],
+    "parent_log_inv_rates": [2, 3],
+    "min_arrival_rate": 0.2,
+    "max_arrival_rate": 1.0,
+    "rate_precision_fraction": 0.1
+  }
+}

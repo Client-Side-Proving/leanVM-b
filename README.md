@@ -57,6 +57,53 @@ recursion 2→1, over leaves of 900 signatures
   verifying                   : 0.0148 s
 ```
 
+### Application-constrained recursive benchmark
+
+The query benchmark searches the supplied thread, memory, deadline, and proof-bandwidth limits and reports the tested configuration with the greatest passing input rate. The current workload adapter generates XMSS child proofs. Child-proof generation finishes before timed arrivals begin, so input-to-root latency starts when a child proof becomes available.
+
+The runner requires Python 3 and the Rust toolchain. It builds `leanvm-b` in release mode with native CPU instructions. Start with a copy of the example query:
+
+```bash
+cp scripts/recursion-benchmark-example.json target/recursion-query.json
+
+python3 scripts/run_recursion_benchmark.py \
+  --spec target/recursion-query.json \
+  --tier screening \
+  --output target/recursion-query-screening
+```
+
+`screening` measures three samples per parent-proof configuration and six completed roots per arrival-rate candidate. It compares the largest observed input-to-root latency with the configured deadline. Use it to check the query and obtain initial measurements. `standard` measures ten parent samples and 30 roots and reports the observed 99th-percentile latency. `publication` runs three fresh measurements of 100 roots and compares the one-sided 95% upper confidence bound for the 99th percentile with the deadline.
+
+The example query restricts the number of child proofs per parent to 2, 3, and 4; WHIR rates to 1/4 and 1/8; and the machine allocation to at most two performance threads. These bounds keep the first measurement set limited. Its 100-second deadlines, 40 GiB RAM limit, and 1 GB/s proof-bandwidth budgets are permissive example values, not application recommendations. Replace them with the intended deployment limits before interpreting pass or fail results.
+
+- `hardware_limits.performance_workers`, `efficiency_workers`, and `proving_processes` set the maximum available worker and process counts. By default, the runner tests powers of two and the supplied maximum. Use `--performance-worker-counts 1,2,4` to request exact performance-thread totals within that maximum.
+- `hardware_limits.prover_ram_bytes` sets the combined resident-memory limit for all proving processes.
+- `root_policy` selects a fixed input count, periodic root interval, or batching timeout.
+- `deadlines` sets the input-to-root and root-interval limits in seconds.
+- `network.connected_peers` records the node's peer count. `root_proof_recipients` and `intermediate_proof_recipients` specify how many recipients receive each proof. Ingress and egress budgets are bytes per second.
+- `search.arities` accepts 2 through 16 child proofs per parent. `workload.leaf_log_inv_rates` and `search.parent_log_inv_rates` use `1`, `2`, `3`, and `4` for WHIR rates 1/2, 1/4, 1/8, and 1/16.
+- `search.min_arrival_rate` and `max_arrival_rate` bound the offered child proofs per second. `rate_precision_fraction` controls how closely the runner narrows the passing-rate boundary.
+
+To continue an interrupted run using its completed parent-proof measurements, supply the same query and output directory with `--resume`:
+
+```bash
+python3 scripts/run_recursion_benchmark.py \
+  --spec target/recursion-query.json \
+  --tier screening \
+  --output target/recursion-query-screening \
+  --resume
+```
+
+The output directory contains:
+
+- `summary.json`: the greatest passing tested rate and configuration, or the closest tested candidate when none passes every limit.
+- `candidates.json` and `candidates.csv`: measurements and per-limit results for every arrival-rate candidate.
+- `capacity.csv`: isolated parent-proof measurements used to select tree configurations.
+- `raw.jsonl`: the complete append-only measurement record.
+- `query.json`: the exact query used for the run.
+
+Proof bandwidth is calculated from serialized proof sizes and the configured recipient counts. It does not send packets through a network interface. The checked-in [interactive report](doc/recursive-benchmark-results.html) is a standalone presentation of the current result set; running the benchmark writes JSON and CSV artifacts and does not rewrite that report.
+
 ### Fibonacci
 
 

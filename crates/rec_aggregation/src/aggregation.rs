@@ -462,6 +462,19 @@ impl AggregateSignature {
         self.verify()
     }
 
+    pub(crate) fn proof_shape_against(
+        &self,
+        message: &xmss::Message,
+        epoch: u32,
+    ) -> Result<lean_vm::cpu::ProofShape, VerifyError> {
+        if &self.message != message || self.epoch != epoch {
+            return Err(VerifyError::UnexpectedStatement);
+        }
+        check_signer_set(&self.public_keys)?;
+        let pi = self.public_input();
+        lean_vm::cpu::proof_shape(unified_guest(), &pi, &self.proof).map_err(VerifyError::Proof)
+    }
+
     /// Verify the aggregate's internal consistency: the signer set is well
     /// formed, the three deferred fixed-polynomial claims hold at their
     /// transmitted points, and the VM proof satisfies the statement built from
@@ -1485,8 +1498,8 @@ fn gen_verify(
 /// The guest's stacked-size dispatch range: one `match_range` opening arm per
 /// candidate `mu` in `MU_MIN..=MU_MAX` (mirrored by the soundness test's
 /// residual-log cap).
-const MU_MIN: usize = 22;
-const MU_MAX: usize = 28;
+pub const MU_MIN: usize = 22;
+pub const MU_MAX: usize = 28;
 
 /// The guest's baked buffer caps, which `placeholder_map` compiles in and
 /// `gen_verify` admits against: one definition, so a hinted shape can never
@@ -1842,12 +1855,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     // stand-in of the right size is what lets the map exist before the bytecode
     // it describes does.
     let stand_in = vec![lean_vm::cpu::Op::Xor { a: 0, b: 0, c: 0 }; 1 << kbc];
-    let l = lean_vm::cpu::layout(
-        &stand_in,
-        20,
-        [1usize << 10; lean_vm::tables::N_TABLES],
-        [F192::ZERO, F192::ZERO],
-    );
+    let l = lean_vm::cpu::layout(&stand_in, 20, [10; lean_vm::tables::N_TABLES], [F192::ZERO, F192::ZERO]);
     let sides: [&[Block]; 3] = [&l.push, &l.pull, &l.count];
     let lcrounds = flock::blake2s::K_LOG - 6;
 

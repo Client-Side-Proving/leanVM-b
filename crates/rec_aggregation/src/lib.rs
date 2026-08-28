@@ -4,17 +4,28 @@
 
 pub mod aggregation;
 pub mod benchmark;
+mod capacity;
 pub mod fibonacci;
 /// The BLAKE2s hash chain, proven end to end. A `src` module rather than its own
 /// test binary so it shares the process, and so the ~1.9 s flock circuit build,
 /// with the other workloads.
 #[cfg(test)]
 mod hash_chain;
+pub mod query;
+pub mod query_run;
 pub mod signers_cache;
+pub mod workload;
 
 pub use aggregation::{AggregateError, AggregateSignature, VerifyError, aggregate};
 pub use benchmark::{run_recursion, run_xmss_aggregation};
+pub use capacity::run_capacity_case as run_recursion_capacity_case;
 pub use fibonacci::run_fibonacci;
+pub use query::{
+    ArrivalConfig, ArrivalEvent, BenchmarkQuery, JobCost, ProofSource, RootBatch, RootLifecycle, RootPolicy,
+    TreeLevelPlan, TreePlan, arrival_events, close_root_batches, plan_tree,
+};
+pub use query_run::run_query_case as run_recursion_benchmark_case;
+pub use workload::{ProofMetadata, WorkloadAdapter, WorkloadDescription, XmssLeafSpec, XmssWorkloadAdapter};
 
 /// The pieces every workload's benchmark report ends with.
 ///

@@ -109,11 +109,26 @@ fn announce_public(ps: &mut ProverState, log_mem: usize, taus: [usize; tables::N
     ps.add_scalar(F192::new(log_inv_rate as u64, 0, 0));
 }
 
+/// Public proof dimensions and the WHIR code rate announced in the transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProofShape {
+    pub fs_seed: [F192; 2],
+    pub log_bytecode: usize,
+    pub log_mem: usize,
+    pub taus: [usize; tables::N_TABLES],
+    pub m: usize,
+    pub log_inv_rate: usize,
+}
+
 /// Verifier side of [`announce_public`]: read the announced sizes and PCS
 /// rate from the stream, validate them, and reconstruct the public [`Layout`]
 /// from the program + sizes + public input. (The public input was already bound
 /// by seeding the transcript.)
-fn read_public(vs: &mut VerifierState, prog: &Program, public_input: &[F192; 2]) -> Result<(Layout, usize), Error> {
+fn read_public(
+    vs: &mut VerifierState,
+    prog: &Program,
+    public_input: &[F192; 2],
+) -> Result<(Layout, ProofShape), Error> {
     let read_size = |vs: &mut VerifierState| -> Result<usize, Error> {
         let word = vs.next_scalar().map_err(Error::Transcript)?;
         if word.c1 != 0 || word.c2 != 0 {
@@ -150,7 +165,23 @@ fn read_public(vs: &mut VerifierState, prog: &Program, public_input: &[F192; 2])
         return Err(Error::PublicInput);
     }
     let l = layout(&prog.prog, log_mem, taus, *public_input);
-    Ok((l, log_inv_rate))
+    let shape = ProofShape {
+        fs_seed: fs_seed(prog),
+        log_bytecode: crate::log2_strict_usize(prog.prog.len()),
+        log_mem,
+        taus,
+        m: l.m,
+        log_inv_rate,
+    };
+    Ok((l, shape))
+}
+
+/// Read the proof dimensions without running the full verifier.
+///
+/// Callers must verify received proofs before trusting these values.
+pub fn proof_shape(program: &Program, public_input: &[F192; 2], proof: &Proof) -> Result<ProofShape, Error> {
+    let mut vs = VerifierState::new(b"leanvm-b", proof, &transcript_seed(program, public_input));
+    read_public(&mut vs, program, public_input).map(|(_, shape)| shape)
 }
 
 #[derive(Clone)]
@@ -657,7 +688,7 @@ pub struct VerifySummary {
 #[tracing::instrument(name = "Verify", skip_all)]
 pub fn verify(program: &Program, public_input: &[F192; 2], proof: &Proof) -> Result<VerifySummary, Error> {
     let mut vs = VerifierState::new(b"leanvm-b", proof, &transcript_seed(program, public_input));
-    let (l, log_inv_rate) = read_public(&mut vs, program, public_input)?;
+    let (l, shape) = read_public(&mut vs, program, public_input)?;
     let root = pcs::read_commitment(&mut vs).map_err(Error::Transcript)?;
 
     // BLAKE2s to flock (single PCS): flock's R1CS validity and every leanVM point
@@ -712,14 +743,14 @@ pub fn verify(program: &Program, public_input: &[F192; 2], proof: &Proof) -> Res
     let flock_stream_end = vs.stream_offset();
     let ring =
         crate::blake2s_flock::ring_switch_verify(n_blocks, offset, replay.ab, replay.c, &replay.lc_claim.s_hat_v);
-    pcs::verify(&mut vs, &slots, &ring, l.m, log_inv_rate, &root).map_err(Error::Open)?;
+    pcs::verify(&mut vs, &slots, &ring, l.m, shape.log_inv_rate, &root).map_err(Error::Open)?;
     vs.finish().map_err(Error::Transcript)?;
     Ok(VerifySummary {
         bytecode_claims: bus.bytecode_claims,
         count_root: bus.count_root,
         zc_claim: replay.zc_claim,
         lc_claim: replay.lc_claim,
-        log_inv_rate,
+        log_inv_rate: shape.log_inv_rate,
         flock_stream_end,
         raw: vs.into_raw_proof(),
     })

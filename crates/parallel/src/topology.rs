@@ -22,30 +22,50 @@ impl Topology {
 
 /// The pool's shape, resolved once.
 ///
-/// `LEANVM_NUM_THREADS` (or `RAYON_NUM_THREADS`, honored so existing benchmark
-/// invocations keep their meaning) sets the **performance**-worker count; the
-/// efficiency workers are added on top either way, because that count has always
-/// meant "how wide is the fast cluster" here and not "how many threads exist".
-/// `1` is the exception and means strictly sequential (no workers at all), so a
-/// single-threaded debugging run really is one thread.
+/// `LEANVM_NUM_PERFORMANCE_THREADS` and `LEANVM_NUM_EFFICIENCY_THREADS` set each
+/// cluster independently. `LEANVM_NUM_THREADS` and `RAYON_NUM_THREADS` remain
+/// aliases for the performance-worker count and retain the detected efficiency
+/// workers. A legacy value of `1` means strictly sequential.
 #[must_use]
 pub fn topology() -> Topology {
     static TOPOLOGY: OnceLock<Topology> = OnceLock::new();
     *TOPOLOGY.get_or_init(|| {
-        let requested = ["LEANVM_NUM_THREADS", "RAYON_NUM_THREADS"]
+        let explicit_perf = std::env::var("LEANVM_NUM_PERFORMANCE_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0);
+        let explicit_efficiency = std::env::var("LEANVM_NUM_EFFICIENCY_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        let legacy_perf = ["LEANVM_NUM_THREADS", "RAYON_NUM_THREADS"]
             .iter()
             .find_map(|key| std::env::var(key).ok())
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0);
-        match requested {
-            Some(1) => Topology { perf: 1, efficiency: 0 },
-            Some(perf) => Topology {
-                perf,
-                efficiency: efficiency_cores(),
-            },
-            None => default_topology(),
-        }
+        resolve_topology(explicit_perf, explicit_efficiency, legacy_perf, default_topology())
     })
+}
+
+fn resolve_topology(
+    explicit_perf: Option<usize>,
+    explicit_efficiency: Option<usize>,
+    legacy_perf: Option<usize>,
+    detected: Topology,
+) -> Topology {
+    if explicit_perf.is_some() || explicit_efficiency.is_some() {
+        return Topology {
+            perf: explicit_perf.unwrap_or(detected.perf).max(1),
+            efficiency: explicit_efficiency.unwrap_or(detected.efficiency),
+        };
+    }
+    match legacy_perf {
+        Some(1) => Topology { perf: 1, efficiency: 0 },
+        Some(perf) => Topology {
+            perf,
+            efficiency: detected.efficiency,
+        },
+        None => detected,
+    }
 }
 
 /// Worker count including the dispatcher.
@@ -154,5 +174,31 @@ pub(crate) fn set_qos(qos: Qos) {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = qos;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DETECTED: Topology = Topology { perf: 8, efficiency: 4 };
+
+    #[test]
+    fn explicit_cluster_limits_are_independent() {
+        assert_eq!(resolve_topology(Some(4), Some(0), None, DETECTED).perf, 4);
+        assert_eq!(resolve_topology(Some(4), Some(0), None, DETECTED).efficiency, 0);
+        assert_eq!(resolve_topology(Some(4), Some(2), None, DETECTED).total(), 6);
+    }
+
+    #[test]
+    fn legacy_single_thread_remains_sequential() {
+        assert_eq!(resolve_topology(None, None, Some(1), DETECTED).total(), 1);
+    }
+
+    #[test]
+    fn legacy_performance_limit_retains_detected_efficiency_workers() {
+        let topology = resolve_topology(None, None, Some(4), DETECTED);
+        assert_eq!(topology.perf, 4);
+        assert_eq!(topology.efficiency, 4);
     }
 }

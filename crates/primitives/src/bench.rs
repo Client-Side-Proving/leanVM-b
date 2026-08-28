@@ -136,6 +136,14 @@ pub struct Timing {
     samples: Vec<f64>,
 }
 
+/// Process CPU counters and peak resident set size at one instant.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct ProcessUsage {
+    pub user_cpu_seconds: f64,
+    pub system_cpu_seconds: f64,
+    pub peak_rss_bytes: u64,
+}
+
 impl Timing {
     /// Record one measured pass.
     pub fn push(&mut self, secs: f64) {
@@ -269,13 +277,25 @@ impl Plan {
 /// picture. Read after a warmup pass, this is the steady-state footprint.
 #[must_use]
 pub fn peak_rss_bytes() -> u64 {
+    process_usage().peak_rss_bytes
+}
+
+/// Read process CPU counters and peak resident set size.
+#[must_use]
+pub fn process_usage() -> ProcessUsage {
     // SAFETY: `getrusage` only writes into the `rusage` we hand it, which is
     // zeroed and correctly sized.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) };
     let max = usage.ru_maxrss as u64;
     // `ru_maxrss` is bytes on macOS and KiB on Linux.
-    if cfg!(target_os = "macos") { max } else { max * 1024 }
+    let peak_rss_bytes = if cfg!(target_os = "macos") { max } else { max * 1024 };
+    let seconds = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 * 1e-6;
+    ProcessUsage {
+        user_cpu_seconds: seconds(usage.ru_utime),
+        system_cpu_seconds: seconds(usage.ru_stime),
+        peak_rss_bytes,
+    }
 }
 
 /// Read a `usize` benchmark knob from the environment, defaulting when unset.

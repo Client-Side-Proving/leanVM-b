@@ -17,6 +17,7 @@
 //! thermally limited laptop does not report its power budget as proving cost.
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 struct Cli {
@@ -73,6 +74,50 @@ enum Command {
         #[arg(long, default_value = "900")]
         xmss_per_leaf: usize,
     },
+    /// One isolated parent-proof measurement used by the query benchmark.
+    #[command(hide = true)]
+    RecursionCapacityCase {
+        #[arg(long)]
+        arity: usize,
+        #[arg(long)]
+        xmss_per_child: usize,
+        #[arg(long)]
+        child_log_inv_rate: usize,
+        #[arg(long)]
+        parent_log_inv_rate: usize,
+        #[arg(long, value_delimiter = ',')]
+        signer_starts: Vec<usize>,
+        #[arg(long)]
+        run_id: String,
+    },
+    /// One measured application-query point, launched by the Python runner.
+    #[command(hide = true)]
+    RecursionBenchmarkCase {
+        #[arg(long)]
+        query: PathBuf,
+        #[arg(long)]
+        costs: PathBuf,
+        #[arg(long)]
+        arrival_rate: f64,
+        #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=4))]
+        leaf_log_inv_rate: usize,
+        #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+        root_target: usize,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value_t = 0)]
+        root_shard_index: usize,
+        #[arg(long, default_value_t = 1)]
+        root_shard_count: usize,
+        #[arg(long)]
+        barrier_dir: Option<PathBuf>,
+    },
+    /// Validate an application query without starting the prover.
+    #[command(hide = true)]
+    RecursionBenchmarkValidate {
+        #[arg(long)]
+        query: PathBuf,
+    },
     /// Prove and verify Fibonacci in the exponent (demo).
     Fibonacci {
         /// Number of recurrence steps.
@@ -83,6 +128,11 @@ enum Command {
 
 fn main() {
     let cli = Cli::parse();
+    if let Command::RecursionBenchmarkValidate { query } = &cli.command {
+        rec_aggregation::BenchmarkQuery::from_path(query).expect("recursion benchmark query is valid");
+        println!("valid recursion benchmark query");
+        return;
+    }
     // Pinned worker pool plus the proving arena, for every workload below. Both
     // are process-wide policy, which is why they are set here and not inside the
     // library entry points.
@@ -99,6 +149,52 @@ fn main() {
         // does not want traced.
         Command::Recursion { n, xmss_per_leaf } => {
             rec_aggregation::run_recursion(*n, *xmss_per_leaf, cli.log_inv_rate, cli.tracing, plan);
+        }
+        Command::RecursionCapacityCase {
+            arity,
+            xmss_per_child,
+            child_log_inv_rate,
+            parent_log_inv_rate,
+            signer_starts,
+            run_id,
+        } => {
+            rec_aggregation::run_recursion_capacity_case(
+                *arity,
+                *xmss_per_child,
+                *child_log_inv_rate,
+                *parent_log_inv_rate,
+                signer_starts.clone(),
+                run_id.clone(),
+                plan,
+            )
+            .expect("parent-proof measurement succeeds");
+        }
+        Command::RecursionBenchmarkCase {
+            query,
+            costs,
+            arrival_rate,
+            leaf_log_inv_rate,
+            root_target,
+            run_id,
+            root_shard_index,
+            root_shard_count,
+            barrier_dir,
+        } => {
+            rec_aggregation::run_recursion_benchmark_case(
+                query,
+                costs,
+                *arrival_rate,
+                *leaf_log_inv_rate,
+                *root_target,
+                run_id.clone(),
+                *root_shard_index,
+                *root_shard_count,
+                barrier_dir.as_deref(),
+            )
+            .expect("recursion benchmark query case succeeds");
+        }
+        Command::RecursionBenchmarkValidate { .. } => {
+            unreachable!("query validation returns before prover initialization")
         }
         Command::Fibonacci { n } => {
             if cli.tracing {

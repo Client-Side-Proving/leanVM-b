@@ -157,7 +157,11 @@ fn find_first_returns_the_global_minimum() {
 fn default_topology_reserves_no_worker_on_a_homogeneous_host() {
     // The env vars this binary may have inherited would pin the count and defeat
     // the check, so only assert when nothing is pinned.
-    if std::env::var_os("LEANVM_NUM_THREADS").is_some() || std::env::var_os("RAYON_NUM_THREADS").is_some() {
+    if std::env::var_os("LEANVM_NUM_PERFORMANCE_THREADS").is_some()
+        || std::env::var_os("LEANVM_NUM_EFFICIENCY_THREADS").is_some()
+        || std::env::var_os("LEANVM_NUM_THREADS").is_some()
+        || std::env::var_os("RAYON_NUM_THREADS").is_some()
+    {
         return;
     }
     let topo = parallel::topology();
