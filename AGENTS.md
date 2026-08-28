@@ -123,3 +123,20 @@ The third is worth understanding before touching the verifier. `guests/aggregate
 ## Side notes
 
 - proofs, and thus proof size, are not deterministic; due to Proof of Work grinding, which is multi-threaded.
+
+## Obtaining recursive benchmark results
+
+Run the query benchmark from the repository root. Copy the example query, replace its hardware, deadline, network, and search limits with the intended values, then run:
+
+```bash
+cp scripts/recursion-benchmark-example.json target/recursion-query.json
+
+python3 scripts/run_recursion_benchmark.py \
+  --spec target/recursion-query.json \
+  --tier screening \
+  --output target/recursion-query-screening
+```
+
+Use `screening` for an initial run with three parent samples and six completed roots per candidate. Use `standard` for ten parent samples and 30 completed roots. Use `publication` for three fresh measurements of 100 completed roots. Resume an interrupted run by adding `--resume` while keeping the same query and output directory.
+
+The command prints the path to `summary.json`. Read `summary.json` for the selected rate and configuration, `candidates.json` or `candidates.csv` for every tested candidate and its failed limits, `capacity.csv` for the parent proof measurements used to select recursion trees, and `raw.jsonl` for the complete measurement record. The interactive report is `doc/recursive-benchmark-results.html`. Benchmark runs write JSON and CSV results and do not regenerate the HTML report.
