@@ -12,6 +12,7 @@ A minimal (zero-knowledge Virtual Machine, which is actually not ZK in the real 
 Primary goal:
 - Aggregate XMSS (stateful hash based signatures), via a snark proving knowledge soundness of the signatures, against a common message and a lust of public keys
 - Further aggregate n previously aggregated signatures, which is performed by a recursive snark, that proves "I know n sub-proofs that are valid and the union of the public keys they handle contains the list of public keys I am given in public input". 
+- Prove and recursively aggregate Privacy Pool style withdrawals with two depth-32 Merkle paths, a 128-bit balance transition, and BLAKE2s-256 commitments and nullifiers.
 
 ## Layout
 
@@ -28,7 +29,7 @@ Dependency order, leaves first:
 | `lean_vm`         | arithmetization: tables, bus, constraints, `cpu::prove`/`verify`       |
 | `lean_compiler`   | zkDSL (Python subset) → ISA                                            |
 | `xmss`            | XMSS over BLAKE2s; an independent leaf, consumed only by `rec_aggregation` |
-| `rec_aggregation` | recursive XMSS aggregation: the one guest, the public API, the benchmarks |
+| `rec_aggregation` | two independent self-recursive aggregation guests, public APIs, and benchmarks |
 
 `src/main.rs` is the CLI; guests are zkDSL under `crates/rec_aggregation/guests/`.
 
@@ -53,6 +54,9 @@ Heavy benches and measurement harnesses are `#[ignore]`d; run by name with `-- -
 The benchmarks we care about:
 - `cargo run --release -- xmss --n-signatures 890 --log-inv-rate 1 --repeat 3`
 - `cargo run --release -- recursion --n 2 --xmss-per-leaf 890 --log-inv-rate 2 --repeat 3`
+- `python3 scripts/run_recursion_benchmark.py --spec scripts/privacy-pool-withdrawal-screening.json --tier screening --output target/privacy-pool-withdrawal-screening --time-budget-seconds 43200 --finish-reserve-seconds 1800 --case-timeout-seconds 3600 --performance-worker-counts 8,4,2,1`
+
+Schema 2 benchmark outputs are append-only until normalized reports are written. Resume only with the same query, source fingerprint, adapter configuration, release binary, and output directory. A candidate checkpoint is reusable only when every expected root has parsed and verified in memory and after serialization against the same plan digest and expected withdrawal list digest.
 
 ## The proving arena (`zk_alloc`)
 
@@ -84,6 +88,8 @@ The third is worth understanding before touching the verifier. `guests/aggregate
 
 - The guest is **self-referential**: it verifies proofs of itself, so `unified_guest` compiles it to a fixed point on its own log size. The digest needs no fixed point, riding the statement instead of the code, which is also what lets one bytecode serve any inner size and PCS rate.
 - It does not verify *quite* everything in-circuit. Three claims on fixed polynomials (stacked bytecode, flock's A0/B0) are deferred. Each node batches its children's carried claims with the fresh ones its verifications raise, `2n` per polynomial down to one; only the root's are discharged natively, by `AggregateSignature::verify` (explained in `doc/leanvm/`).
+
+Privacy Pool recursion uses the independent `privacy_pool_withdrawal.py` guest and the matching verifier in `privacy_recursive.rs`. Its public statement is the ordered list of fixed-width withdrawal records. Parent proofs bind and cover the complete ordered child statements, carry all deferred claims, and are verified at the root against the exact expected withdrawal list. Proofs and cache entries that survive a proving phase must use ordinary `Vec`, as with XMSS.
 
 `aggregate_two_to_one` is the fast end-to-end check; `aggregate_statement_binds` and `aggregate_hints_bind` are the adversarial ones, tampering the wire object and the witness respectively. A child must commit at least `2^MU_MIN` or the guest has no opening arm for it, so `aggregate` sets `Program::min_log_committed` and a smaller run grows its `SET` table through the fill blocks until it clears the floor.
 

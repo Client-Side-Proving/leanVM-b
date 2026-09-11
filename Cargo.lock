@@ -220,6 +220,7 @@ dependencies = [
  "lean_vm",
  "primitives",
  "rec_aggregation",
+ "serde_json",
  "zk_alloc",
 ]
 

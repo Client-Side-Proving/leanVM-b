@@ -1,6 +1,6 @@
 //! Versioned application queries and workload-independent tree planning.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -9,7 +9,7 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const QUERY_SCHEMA_VERSION: u32 = 1;
+pub const QUERY_SCHEMA_VERSION: u32 = 2;
 
 fn default_arities() -> Vec<usize> {
     (2..=16).collect()
@@ -40,6 +40,8 @@ fn default_processes() -> usize {
 #[serde(deny_unknown_fields)]
 pub struct BenchmarkQuery {
     pub schema_version: u32,
+    #[serde(default)]
+    pub assumptions: Option<BenchmarkAssumptions>,
     pub workload: WorkloadConfig,
     pub arrivals: ArrivalConfig,
     pub root_policy: RootPolicy,
@@ -52,6 +54,25 @@ pub struct BenchmarkQuery {
     pub search: SearchConfig,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BenchmarkAssumptions {
+    pub snapshot_date: String,
+    pub ethereum_slot_seconds: u64,
+    pub target_block_gas: u64,
+    pub block_gas_limit: u64,
+    pub reference_withdrawal_gas: u64,
+    pub target_withdrawals_per_block: usize,
+    pub maximum_withdrawals_per_block: usize,
+    pub reference_withdrawal_tx: String,
+    #[serde(default)]
+    pub optional_direct_withdrawal_gas: Option<u64>,
+    #[serde(default)]
+    pub optional_direct_maximum_withdrawals_per_block: Option<usize>,
+    #[serde(default)]
+    pub optional_direct_withdrawal_tx: Option<String>,
+}
+
 impl BenchmarkQuery {
     pub fn from_path(path: &Path) -> Result<Self, String> {
         let bytes = fs::read(path).map_err(|error| format!("read benchmark query {}: {error}", path.display()))?;
@@ -62,13 +83,117 @@ impl BenchmarkQuery {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != QUERY_SCHEMA_VERSION {
+        if !(1..=QUERY_SCHEMA_VERSION).contains(&self.schema_version) {
             return Err(format!(
-                "benchmark query schema_version must be {QUERY_SCHEMA_VERSION}, got {}",
+                "benchmark query schema_version must be 1 or {QUERY_SCHEMA_VERSION}, got {}",
                 self.schema_version
             ));
         }
         self.workload.validate()?;
+        if self.schema_version == 2 {
+            self.assumptions
+                .as_ref()
+                .ok_or("schema-2 queries require assumptions")?
+                .validate()?;
+            if self.workload.adapter != "privacy_pool_withdrawal" {
+                return Err("schema-2 queries require the privacy_pool_withdrawal adapter".into());
+            }
+            if self.workload.adapter_schema_version != 1
+                || !matches!(self.workload.proof_source, ProofSource::Generated)
+            {
+                return Err("schema-2 privacy-pool queries require adapter version 1 and generated proofs".into());
+            }
+            let adapter = self
+                .workload
+                .adapter_config
+                .as_object()
+                .ok_or("schema-2 privacy-pool adapter_config must be an object")?;
+            if adapter.get("tree_depth").and_then(Value::as_u64) != Some(32)
+                || adapter.get("hash").and_then(Value::as_str) != Some("blake2s_256")
+            {
+                return Err("schema-2 privacy-pool queries require depth 32 and blake2s_256".into());
+            }
+            if !matches!(self.arrivals.model, ArrivalModel::BlockBurst) {
+                return Err("schema-2 queries require block_burst arrivals".into());
+            }
+            let assumptions = self.assumptions.as_ref().expect("schema-2 assumptions were validated");
+            if self.arrivals.period_seconds != Some(assumptions.ethereum_slot_seconds as f64)
+                || self.arrivals.burst_count != Some(6)
+            {
+                return Err("schema-2 queries require six bursts separated by one recorded Ethereum slot".into());
+            }
+            if !matches!(self.root_policy, RootPolicy::FixedCount { .. })
+                || !matches!(self.root_lifecycle, RootLifecycle::Independent)
+            {
+                return Err("schema-2 queries require independent fixed-count roots".into());
+            }
+            if self.search.inputs_per_root.is_empty()
+                || self.search.nonfinal_rate_pairs.is_empty()
+                || self.search.final_rate_pairs.is_empty()
+                || self.search.primary_root_log_inv_rates.is_empty()
+            {
+                return Err("schema-2 queries require discrete counts and role-specific rate pairs".into());
+            }
+            if self
+                .search
+                .inputs_per_root
+                .iter()
+                .chain(self.search.optional_inputs_per_root.iter())
+                .any(|count| *count == 0)
+            {
+                return Err("schema-2 input counts must be positive".into());
+            }
+            let required_counts = self.search.inputs_per_root.iter().copied().collect::<HashSet<_>>();
+            let optional_counts = self
+                .search
+                .optional_inputs_per_root
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            if required_counts.len() != self.search.inputs_per_root.len()
+                || optional_counts.len() != self.search.optional_inputs_per_root.len()
+                || !required_counts.is_disjoint(&optional_counts)
+            {
+                return Err("schema-2 required and optional input counts must be unique and disjoint".into());
+            }
+            let fixture_count = adapter
+                .get("fixture_count")
+                .and_then(Value::as_u64)
+                .ok_or("schema-2 privacy-pool queries require fixture_count")? as usize;
+            let maximum_count = self
+                .search
+                .inputs_per_root
+                .iter()
+                .chain(&self.search.optional_inputs_per_root)
+                .copied()
+                .max()
+                .expect("schema-2 input counts are nonempty");
+            if fixture_count < maximum_count {
+                return Err("privacy-pool fixture_count must cover every requested input count".into());
+            }
+            if !matches!(self.deadlines.boundary, DeadlineBoundary::Serialized)
+                || self.deadlines.max_input_to_root_seconds != Some(assumptions.ethereum_slot_seconds as f64)
+            {
+                return Err("schema-2 queries require a serialized one-slot input-to-root deadline".into());
+            }
+            for root_rate in self
+                .search
+                .primary_root_log_inv_rates
+                .iter()
+                .chain(&self.search.compression_root_log_inv_rates)
+            {
+                if !self
+                    .workload
+                    .leaf_log_inv_rates
+                    .iter()
+                    .any(|leaf_rate| self.search.rate_reachable(*leaf_rate, *root_rate))
+                {
+                    return Err(format!(
+                        "requested root rate {root_rate} is unreachable through the configured rate pairs"
+                    ));
+                }
+            }
+        }
         self.arrivals.validate()?;
         self.root_policy.validate()?;
         if self.workload.adapter == "xmss"
@@ -113,6 +238,38 @@ impl BenchmarkQuery {
                 return Err(format!(
                     "an exact arrival trace has a mean rate of {trace_rate} inputs/s between its first and last event; search min_arrival_rate and max_arrival_rate must both equal that rate"
                 ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BenchmarkAssumptions {
+    fn validate(&self) -> Result<(), String> {
+        if self.snapshot_date.trim().is_empty()
+            || self.ethereum_slot_seconds == 0
+            || self.target_block_gas == 0
+            || self.block_gas_limit == 0
+            || self.reference_withdrawal_gas == 0
+        {
+            return Err("benchmark assumptions require a date and positive slot and reference gas values".into());
+        }
+        if self.target_withdrawals_per_block != (self.target_block_gas / self.reference_withdrawal_gas) as usize
+            || self.maximum_withdrawals_per_block != (self.block_gas_limit / self.reference_withdrawal_gas) as usize
+        {
+            return Err("withdrawal counts must equal floor division of their recorded gas limits".into());
+        }
+        match (
+            self.optional_direct_withdrawal_gas,
+            self.optional_direct_maximum_withdrawals_per_block,
+        ) {
+            (Some(gas), Some(count)) if gas > 0 && count == (self.block_gas_limit / gas) as usize => {}
+            (None, None) => {}
+            _ => {
+                return Err(
+                    "optional direct withdrawal gas and count must both be present, positive, and use floor division"
+                        .into(),
+                );
             }
         }
         Ok(())
@@ -197,6 +354,7 @@ pub enum ArrivalModel {
     FixedInterval,
     Poisson,
     Trace,
+    BlockBurst,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -210,6 +368,10 @@ pub struct ArrivalConfig {
     pub sources: Vec<ArrivalSource>,
     #[serde(default)]
     pub phases: Vec<ArrivalPhase>,
+    #[serde(default)]
+    pub period_seconds: Option<f64>,
+    #[serde(default)]
+    pub burst_count: Option<usize>,
     #[serde(default = "default_seed")]
     pub seed: u64,
 }
@@ -243,7 +405,16 @@ impl ArrivalConfig {
                 return Err("arrival phase rate_multiplier must be finite and positive".into());
             }
         }
-        if matches!(self.model, ArrivalModel::Trace) {
+        if matches!(self.model, ArrivalModel::BlockBurst) {
+            let period = self.period_seconds.ok_or("block_burst requires period_seconds")?;
+            let bursts = self.burst_count.ok_or("block_burst requires burst_count")?;
+            if !period.is_finite() || period <= 0.0 || bursts == 0 {
+                return Err("block_burst period_seconds and burst_count must be positive".into());
+            }
+            if !self.events.is_empty() || !self.sources.is_empty() || !self.phases.is_empty() {
+                return Err("block_burst does not accept trace events, sources, or phases".into());
+            }
+        } else if matches!(self.model, ArrivalModel::Trace) {
             if self.events.is_empty() {
                 return Err("an arrival trace must contain at least one event".into());
             }
@@ -264,6 +435,8 @@ impl ArrivalConfig {
             if !self.phases.is_empty() {
                 return Err("arrival phases cannot be combined with an explicit trace".into());
             }
+        } else if self.period_seconds.is_some() || self.burst_count.is_some() {
+            return Err("period_seconds and burst_count are valid only for block_burst".into());
         } else if !self.events.is_empty() {
             return Err("arrival events are valid only when kind is trace".into());
         }
@@ -275,6 +448,7 @@ impl ArrivalConfig {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RootPolicy {
     FixedCount {
+        #[serde(default = "default_fixed_inputs_per_root")]
         inputs_per_root: usize,
     },
     Periodic {
@@ -287,6 +461,10 @@ pub enum RootPolicy {
         #[serde(default)]
         max_inputs: Option<usize>,
     },
+}
+
+fn default_fixed_inputs_per_root() -> usize {
+    1
 }
 
 impl RootPolicy {
@@ -369,6 +547,8 @@ pub struct DeadlineLimits {
     #[serde(default)]
     pub max_tick_lateness_seconds: Option<f64>,
     #[serde(default)]
+    pub max_input_to_root_seconds: Option<f64>,
+    #[serde(default)]
     pub boundary: DeadlineBoundary,
 }
 
@@ -378,6 +558,7 @@ impl DeadlineLimits {
             ("p99_input_to_root_seconds", self.p99_input_to_root_seconds),
             ("max_root_interval_seconds", self.max_root_interval_seconds),
             ("max_tick_lateness_seconds", self.max_tick_lateness_seconds),
+            ("max_input_to_root_seconds", self.max_input_to_root_seconds),
         ] {
             if value.is_some_and(|seconds| !seconds.is_finite() || seconds <= 0.0) {
                 return Err(format!("deadline {name} must be finite and positive"));
@@ -439,7 +620,9 @@ pub struct SearchConfig {
     pub arities: Vec<usize>,
     #[serde(default = "default_rates")]
     pub parent_log_inv_rates: Vec<usize>,
+    #[serde(default = "default_min_arrival_rate")]
     pub min_arrival_rate: f64,
+    #[serde(default = "default_max_arrival_rate")]
     pub max_arrival_rate: f64,
     #[serde(default = "default_rate_precision")]
     pub rate_precision_fraction: f64,
@@ -447,6 +630,34 @@ pub struct SearchConfig {
     pub parent_measurement_mode: ParentMeasurementMode,
     #[serde(default = "default_thread_scaling_arities")]
     pub thread_scaling_arities: Vec<usize>,
+    #[serde(default)]
+    pub inputs_per_root: Vec<usize>,
+    #[serde(default)]
+    pub optional_inputs_per_root: Vec<usize>,
+    #[serde(default)]
+    pub nonfinal_rate_pairs: Vec<RatePair>,
+    #[serde(default)]
+    pub final_rate_pairs: Vec<RatePair>,
+    #[serde(default)]
+    pub primary_root_log_inv_rates: Vec<usize>,
+    #[serde(default)]
+    pub compression_root_log_inv_rates: Vec<usize>,
+    #[serde(default)]
+    pub diagnostic_rate_matrix_arities: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RatePair {
+    pub child_log_inv_rate: usize,
+    pub parent_log_inv_rate: usize,
+}
+
+fn default_min_arrival_rate() -> f64 {
+    0.01
+}
+fn default_max_arrival_rate() -> f64 {
+    1.0
 }
 
 impl Default for SearchConfig {
@@ -459,6 +670,13 @@ impl Default for SearchConfig {
             rate_precision_fraction: default_rate_precision(),
             parent_measurement_mode: ParentMeasurementMode::Full,
             thread_scaling_arities: default_thread_scaling_arities(),
+            inputs_per_root: Vec::new(),
+            optional_inputs_per_root: Vec::new(),
+            nonfinal_rate_pairs: Vec::new(),
+            final_rate_pairs: Vec::new(),
+            primary_root_log_inv_rates: Vec::new(),
+            compression_root_log_inv_rates: Vec::new(),
+            diagnostic_rate_matrix_arities: Vec::new(),
         }
     }
 }
@@ -493,7 +711,55 @@ impl SearchConfig {
                 "adaptive parent measurement needs nonempty thread_scaling_arities drawn from search arities".into(),
             );
         }
+        for (label, pairs) in [
+            ("nonfinal_rate_pairs", &self.nonfinal_rate_pairs),
+            ("final_rate_pairs", &self.final_rate_pairs),
+        ] {
+            let mut unique = HashSet::new();
+            for pair in pairs {
+                validate_rates(label, &[pair.child_log_inv_rate, pair.parent_log_inv_rate])?;
+                if !unique.insert((pair.child_log_inv_rate, pair.parent_log_inv_rate)) {
+                    return Err(format!("search {label} contains a duplicate pair"));
+                }
+            }
+        }
+        if !self.primary_root_log_inv_rates.is_empty() {
+            validate_rates("search primary_root_log_inv_rates", &self.primary_root_log_inv_rates)?;
+        }
+        if !self.compression_root_log_inv_rates.is_empty() {
+            validate_rates(
+                "search compression_root_log_inv_rates",
+                &self.compression_root_log_inv_rates,
+            )?;
+        }
+        if self
+            .diagnostic_rate_matrix_arities
+            .iter()
+            .any(|arity| !self.arities.contains(arity))
+        {
+            return Err("diagnostic rate-matrix arities must be drawn from search arities".into());
+        }
         Ok(())
+    }
+
+    fn rate_reachable(&self, leaf_rate: usize, root_rate: usize) -> bool {
+        let mut reachable = HashSet::from([leaf_rate]);
+        loop {
+            let next = self
+                .nonfinal_rate_pairs
+                .iter()
+                .filter(|pair| reachable.contains(&pair.child_log_inv_rate))
+                .map(|pair| pair.parent_log_inv_rate)
+                .collect::<Vec<_>>();
+            let prior_len = reachable.len();
+            reachable.extend(next);
+            if reachable.len() == prior_len {
+                break;
+            }
+        }
+        self.final_rate_pairs
+            .iter()
+            .any(|pair| reachable.contains(&pair.child_log_inv_rate) && pair.parent_log_inv_rate == root_rate)
     }
 }
 
@@ -519,6 +785,21 @@ pub fn arrival_events(config: &ArrivalConfig, rate: f64, count: usize) -> Result
     }
     if count == 0 {
         return Ok(Vec::new());
+    }
+    if matches!(config.model, ArrivalModel::BlockBurst) {
+        let period = config.period_seconds.ok_or("block_burst requires period_seconds")?;
+        let burst_count = config.burst_count.ok_or("block_burst requires burst_count")?;
+        let per_burst = count.div_ceil(burst_count);
+        return Ok((0..burst_count)
+            .flat_map(|burst| {
+                (0..per_burst).map(move |within| ArrivalEvent {
+                    input_index: burst * per_burst + within,
+                    seconds: burst as f64 * period,
+                    source: 0,
+                })
+            })
+            .take(count)
+            .collect());
     }
     if matches!(config.model, ArrivalModel::Trace) {
         if count > config.events.len() {
@@ -570,6 +851,7 @@ pub fn arrival_events(config: &ArrivalConfig, rate: f64, count: usize) -> Result
                 -uniform.ln() / source_rate
             }
             ArrivalModel::Trace => unreachable!("trace returned above"),
+            ArrivalModel::BlockBurst => unreachable!("block-burst arrivals returned above"),
         };
         next[source] += delta;
     }
@@ -702,6 +984,12 @@ pub struct JobCost {
     pub output_bytes: usize,
     /// True when this cost was validated with the candidate's exact upper-level child proof shapes.
     pub directly_measured: bool,
+    #[serde(default = "default_job_cost_workers")]
+    pub performance_workers: usize,
+}
+
+fn default_job_cost_workers() -> usize {
+    1
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -809,12 +1097,169 @@ pub fn plan_tree(
     })
 }
 
-fn plan_state<'a>(
+/// Plan a schema-2 tree using explicit role-specific rate transitions. Levels
+/// that leave more than one output use `nonfinal_pairs`; the level that emits
+/// the root uses `final_pairs` and must end at `required_root_log_inv_rate`.
+pub fn plan_tree_with_rate_pairs(
+    leaf_count: usize,
+    leaf_log_inv_rate: usize,
+    required_root_log_inv_rate: usize,
+    arities: &[usize],
+    nonfinal_pairs: &[RatePair],
+    final_pairs: &[RatePair],
+    costs: &[JobCost],
+) -> Result<TreePlan, String> {
+    if leaf_count == 0 {
+        return Err("tree planning needs at least one leaf".into());
+    }
+    validate_rates("tree leaf rate", &[leaf_log_inv_rate])?;
+    validate_rates("tree required root rate", &[required_root_log_inv_rate])?;
+    if arities.is_empty() || arities.iter().any(|arity| !(2..=16).contains(arity)) {
+        return Err("tree arities must be in 2..=16".into());
+    }
+    if leaf_count == 1 {
+        if leaf_log_inv_rate != required_root_log_inv_rate {
+            return Err("a one-leaf tree cannot change its root rate".into());
+        }
+        return Ok(TreePlan {
+            leaf_count,
+            leaf_log_inv_rate,
+            root_log_inv_rate: required_root_log_inv_rate,
+            levels: Vec::new(),
+            total_jobs: 0,
+            estimated_service_seconds: 0.0,
+            estimated_peak_rss_bytes: 0,
+            all_job_costs_directly_measured: true,
+        });
+    }
+    let cost_map = costs
+        .iter()
+        .map(|cost| {
+            (
+                (cost.child_count, cost.child_log_inv_rate, cost.parent_log_inv_rate),
+                cost,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut memo = HashMap::new();
+    let best = plan_state_with_pairs(
+        leaf_count,
+        leaf_log_inv_rate,
+        required_root_log_inv_rate,
+        arities,
+        nonfinal_pairs,
+        final_pairs,
+        &cost_map,
+        &mut memo,
+    )
+    .ok_or_else(|| format!("no permitted rate-pair tree reaches root rate {required_root_log_inv_rate}"))?;
+    Ok(TreePlan {
+        leaf_count,
+        leaf_log_inv_rate,
+        root_log_inv_rate: required_root_log_inv_rate,
+        total_jobs: best
+            .levels
+            .iter()
+            .map(|level| level.child_counts.iter().filter(|count| **count > 1).count())
+            .sum(),
+        estimated_service_seconds: best.cost,
+        estimated_peak_rss_bytes: best.peak_rss,
+        all_job_costs_directly_measured: best.all_measured,
+        levels: best.levels,
+    })
+}
+
+fn plan_state_with_pairs(
+    count: usize,
+    child_rate: usize,
+    required_root_rate: usize,
+    arities: &[usize],
+    nonfinal_pairs: &[RatePair],
+    final_pairs: &[RatePair],
+    costs: &HashMap<(usize, usize, usize), &JobCost>,
+    memo: &mut HashMap<(usize, usize), Option<PartialPlan>>,
+) -> Option<PartialPlan> {
+    if count == 1 {
+        if child_rate != required_root_rate {
+            return None;
+        }
+        return Some(PartialPlan {
+            cost: 0.0,
+            peak_rss: 0,
+            all_measured: true,
+            levels: Vec::new(),
+        });
+    }
+    if let Some(cached) = memo.get(&(count, child_rate)) {
+        return cached.clone();
+    }
+    let mut best = None;
+    let pairs = nonfinal_pairs
+        .iter()
+        .map(|pair| (false, pair))
+        .chain(final_pairs.iter().map(|pair| (true, pair)));
+    for (is_final_pair, pair) in pairs {
+        if !((1..=4).contains(&pair.child_log_inv_rate) && (1..=4).contains(&pair.parent_log_inv_rate)) {
+            continue;
+        }
+        if pair.child_log_inv_rate != child_rate {
+            continue;
+        }
+        if is_final_pair && pair.parent_log_inv_rate != required_root_rate {
+            continue;
+        }
+        let partitions = level_partitions(count, pair.child_log_inv_rate, pair.parent_log_inv_rate, arities, costs);
+        for (output_count, level_plan) in partitions {
+            let final_level = output_count == 1;
+            if final_level != is_final_pair {
+                continue;
+            }
+            let Some(mut upper) = plan_state_with_pairs(
+                output_count,
+                pair.parent_log_inv_rate,
+                required_root_rate,
+                arities,
+                nonfinal_pairs,
+                final_pairs,
+                costs,
+                memo,
+            ) else {
+                continue;
+            };
+            let level = TreeLevelPlan {
+                input_count: count,
+                output_count,
+                child_log_inv_rate: pair.child_log_inv_rate,
+                parent_log_inv_rate: pair.parent_log_inv_rate,
+                child_counts: level_plan.child_counts,
+                estimated_service_seconds: level_plan.cost,
+            };
+            let mut levels = vec![level];
+            levels.append(&mut upper.levels);
+            let candidate = PartialPlan {
+                cost: level_plan.cost + upper.cost,
+                peak_rss: level_plan.peak_rss.max(upper.peak_rss),
+                all_measured: level_plan.all_measured && upper.all_measured,
+                levels,
+            };
+            if best.as_ref().is_none_or(|current: &PartialPlan| {
+                candidate.cost < current.cost
+                    || (candidate.cost == current.cost && candidate.peak_rss < current.peak_rss)
+            }) {
+                best = Some(candidate);
+            }
+        }
+    }
+    memo.insert((count, child_rate), best.clone());
+    best
+}
+
+fn plan_state(
     count: usize,
     child_rate: usize,
     arities: &[usize],
     parent_rates: &[usize],
-    costs: &HashMap<(usize, usize, usize), &'a JobCost>,
+    costs: &HashMap<(usize, usize, usize), &JobCost>,
     memo: &mut HashMap<(usize, usize), Option<PartialPlan>>,
 ) -> Option<PartialPlan> {
     if count == 1 {
@@ -862,12 +1307,12 @@ fn plan_state<'a>(
     best
 }
 
-fn level_partitions<'a>(
+fn level_partitions(
     count: usize,
     child_rate: usize,
     parent_rate: usize,
     arities: &[usize],
-    costs: &HashMap<(usize, usize, usize), &'a JobCost>,
+    costs: &HashMap<(usize, usize, usize), &JobCost>,
 ) -> Vec<(usize, PartialLevel)> {
     let mut sizes = arities
         .iter()
@@ -925,6 +1370,10 @@ fn level_partitions<'a>(
 mod tests {
     use super::*;
 
+    fn privacy_screening_query() -> BenchmarkQuery {
+        serde_json::from_str(include_str!("../../../scripts/privacy-pool-withdrawal-screening.json")).unwrap()
+    }
+
     fn all_costs(arities: &[usize]) -> Vec<JobCost> {
         let mut costs = Vec::new();
         for &child_count in arities {
@@ -938,11 +1387,51 @@ mod tests {
                         peak_rss_bytes: child_count as u64 * 100,
                         output_bytes: 1000,
                         directly_measured: true,
+                        performance_workers: 1,
                     });
                 }
             }
         }
         costs
+    }
+
+    #[test]
+    fn block_burst_arrivals_are_six_independent_bursts() {
+        let config: ArrivalConfig = serde_json::from_value(serde_json::json!({
+            "kind": "block_burst",
+            "period_seconds": 12.0,
+            "burst_count": 6
+        }))
+        .unwrap();
+        let events = arrival_events(&config, 1.0, 12).unwrap();
+        assert_eq!(events.len(), 12);
+        assert_eq!(events.iter().filter(|event| event.seconds == 0.0).count(), 2);
+        assert_eq!(events.iter().filter(|event| event.seconds == 60.0).count(), 2);
+        assert!(events.windows(2).all(|window| window[0].seconds <= window[1].seconds));
+    }
+
+    #[test]
+    fn privacy_block_bursts_cover_six_complete_roots_for_45_and_91_inputs() {
+        let query = privacy_screening_query();
+        for inputs_per_root in [45, 91] {
+            let events = arrival_events(
+                &query.arrivals,
+                1.0,
+                inputs_per_root * query.arrivals.burst_count.unwrap(),
+            )
+            .unwrap();
+            let batches = close_root_batches(&events, &RootPolicy::FixedCount { inputs_per_root }).unwrap();
+            assert_eq!(events.len(), 6 * inputs_per_root);
+            assert_eq!(batches.len(), 6);
+            assert_eq!(
+                batches.iter().map(|batch| batch.close_seconds).collect::<Vec<_>>(),
+                [0.0, 12.0, 24.0, 36.0, 48.0, 60.0]
+            );
+            assert_eq!(
+                events.iter().map(|event| event.input_index).collect::<Vec<_>>(),
+                (0..6 * inputs_per_root).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
@@ -1075,6 +1564,151 @@ mod tests {
     }
 
     #[test]
+    fn privacy_primary_counts_reach_root_rate_one_for_every_leaf_rate() {
+        let arities = (2..=16).collect::<Vec<_>>();
+        let costs = all_costs(&arities);
+        let nonfinal_pairs = (1..=4)
+            .map(|child_log_inv_rate| RatePair {
+                child_log_inv_rate,
+                parent_log_inv_rate: 1,
+            })
+            .collect::<Vec<_>>();
+        let final_pairs = nonfinal_pairs.clone();
+        for leaf_count in [2, 4, 8, 16, 32, 45, 64, 91] {
+            for leaf_log_inv_rate in 1..=4 {
+                let plan = plan_tree_with_rate_pairs(
+                    leaf_count,
+                    leaf_log_inv_rate,
+                    1,
+                    &arities,
+                    &nonfinal_pairs,
+                    &final_pairs,
+                    &costs,
+                )
+                .unwrap_or_else(|error| panic!("N={leaf_count}, leaf rate={leaf_log_inv_rate}: {error}"));
+                assert_eq!(plan.root_log_inv_rate, 1);
+                assert_eq!(plan.levels.last().unwrap().output_count, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn privacy_direct_plans_accept_rates_two_through_four() {
+        let query = privacy_screening_query();
+        let costs = all_costs(&query.search.arities);
+        for leaf_count in [2, 4, 8, 16] {
+            for leaf_log_inv_rate in 2..=4 {
+                let plan = plan_tree_with_rate_pairs(
+                    leaf_count,
+                    leaf_log_inv_rate,
+                    1,
+                    &query.search.arities,
+                    &query.search.nonfinal_rate_pairs,
+                    &query.search.final_rate_pairs,
+                    &costs,
+                )
+                .unwrap();
+                assert_eq!(plan.levels.len(), 1);
+                assert_eq!(plan.levels[0].child_log_inv_rate, leaf_log_inv_rate);
+                assert_eq!(plan.levels[0].parent_log_inv_rate, 1);
+                assert_eq!(plan.levels[0].child_counts, [leaf_count]);
+            }
+        }
+    }
+
+    #[test]
+    fn privacy_query_rejects_duplicate_rate_pairs() {
+        let mut query = privacy_screening_query();
+        query
+            .search
+            .nonfinal_rate_pairs
+            .push(query.search.nonfinal_rate_pairs[0].clone());
+        assert!(query.validate().unwrap_err().contains("duplicate pair"));
+    }
+
+    #[test]
+    fn privacy_large_counts_reach_every_compression_root_rate() {
+        let query = privacy_screening_query();
+        let costs = all_costs(&query.search.arities);
+        for leaf_count in [45, 91] {
+            for root_rate in 2..=4 {
+                let plan = plan_tree_with_rate_pairs(
+                    leaf_count,
+                    1,
+                    root_rate,
+                    &query.search.arities,
+                    &query.search.nonfinal_rate_pairs,
+                    &query.search.final_rate_pairs,
+                    &costs,
+                )
+                .unwrap();
+                assert_eq!(plan.root_log_inv_rate, root_rate);
+                assert_eq!(plan.levels.last().unwrap().parent_log_inv_rate, root_rate);
+                assert!(
+                    plan.levels[..plan.levels.len() - 1]
+                        .iter()
+                        .all(|level| level.parent_log_inv_rate == 1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn final_only_rate_pair_is_never_used_before_the_root() {
+        let arities = (2..=16).collect::<Vec<_>>();
+        let mut costs = all_costs(&arities);
+        for cost in &mut costs {
+            if cost.child_log_inv_rate == 1 && cost.parent_log_inv_rate == 4 {
+                cost.service_seconds = 0.0001;
+            }
+        }
+        let plan = plan_tree_with_rate_pairs(
+            91,
+            1,
+            4,
+            &arities,
+            &[RatePair {
+                child_log_inv_rate: 1,
+                parent_log_inv_rate: 1,
+            }],
+            &[RatePair {
+                child_log_inv_rate: 1,
+                parent_log_inv_rate: 4,
+            }],
+            &costs,
+        )
+        .unwrap();
+        assert!(
+            plan.levels[..plan.levels.len() - 1]
+                .iter()
+                .all(|level| level.parent_log_inv_rate == 1)
+        );
+        assert_eq!(plan.levels.last().unwrap().parent_log_inv_rate, 4);
+    }
+
+    #[test]
+    fn unreachable_required_root_rate_is_an_error() {
+        let arities = (2..=16).collect::<Vec<_>>();
+        let error = plan_tree_with_rate_pairs(
+            45,
+            1,
+            4,
+            &arities,
+            &[RatePair {
+                child_log_inv_rate: 1,
+                parent_log_inv_rate: 1,
+            }],
+            &[RatePair {
+                child_log_inv_rate: 1,
+                parent_log_inv_rate: 1,
+            }],
+            &all_costs(&arities),
+        )
+        .unwrap_err();
+        assert!(error.contains("no permitted rate-pair tree"));
+    }
+
+    #[test]
     fn fixed_periodic_and_timeout_policies_close_different_roots() {
         let arrivals = arrival_events(
             &ArrivalConfig {
@@ -1082,6 +1716,8 @@ mod tests {
                 events: Vec::new(),
                 sources: Vec::new(),
                 phases: Vec::new(),
+                period_seconds: None,
+                burst_count: None,
                 seed: 7,
             },
             2.0,
@@ -1166,6 +1802,8 @@ mod tests {
                     },
                 ],
                 phases: Vec::new(),
+                period_seconds: None,
+                burst_count: None,
                 seed: 7,
             },
             4.0,
@@ -1185,6 +1823,8 @@ mod tests {
                 events: Vec::new(),
                 sources: Vec::new(),
                 phases: Vec::new(),
+                period_seconds: None,
+                burst_count: None,
                 seed: 9,
             },
             2.0,
@@ -1201,6 +1841,8 @@ mod tests {
             events: Vec::new(),
             sources: Vec::new(),
             phases: Vec::new(),
+            period_seconds: None,
+            burst_count: None,
             seed: 9,
         };
         let poisson = arrival_events(&poisson_config, 2.0, 8).unwrap();
@@ -1224,6 +1866,8 @@ mod tests {
                 events: trace,
                 sources: Vec::new(),
                 phases: Vec::new(),
+                period_seconds: None,
+                burst_count: None,
                 seed: 9,
             },
             999.0,

@@ -1,8 +1,8 @@
 //! Workload boundary for recursive aggregation benchmarks.
 //!
-//! Scheduling and hardware analysis operate on this interface. The current
-//! implementation is XMSS, while the interface keeps signer-specific data out
-//! of the benchmark core.
+//! Scheduling and hardware analysis operate on this interface. XMSS and Privacy
+//! Pool withdrawal proofs use independent guests and proof types while sharing
+//! the benchmark operations defined here.
 
 use serde::{Deserialize, Serialize};
 use xmss::{XmssPublicKey, XmssSignature};
@@ -50,6 +50,20 @@ pub trait WorkloadAdapter {
     fn verify(&self, proof: &Self::Proof) -> Result<(), String>;
     fn metadata(&self, proof: &Self::Proof) -> Result<ProofMetadata, String>;
     fn serialize(&self, proof: &Self::Proof) -> Vec<u8>;
+    fn statement_items(&self, _proof: &Self::Proof) -> Result<Vec<Vec<u8>>, String> {
+        Ok(Vec::new())
+    }
+    fn verify_against_items(&self, proof: &Self::Proof, expected: &[Vec<u8>]) -> Result<(), String> {
+        let actual = self.statement_items(proof)?;
+        if actual == expected {
+            Ok(())
+        } else {
+            Err("proof statement items differ from expected items".into())
+        }
+    }
+    fn deserialize(&self, _bytes: &[u8]) -> Result<Self::Proof, String> {
+        Err("this workload does not support deserialization through the generic adapter".into())
+    }
     fn empty_root(&self, _log_inv_rate: usize) -> Result<Option<Self::Proof>, String> {
         Ok(None)
     }
