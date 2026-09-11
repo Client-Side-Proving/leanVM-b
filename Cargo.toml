@@ -15,6 +15,7 @@ primitives.workspace = true
 rec_aggregation.workspace = true
 lean_vm.workspace = true
 zk_alloc.workspace = true
+serde_json.workspace = true
 clap = { version = "4", features = ["derive"] }
 
 [workspace.package]

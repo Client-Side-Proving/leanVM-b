@@ -1,0 +1,79 @@
+{
+  "schema_version": 2,
+  "assumptions": {
+    "snapshot_date": "2026-09-10",
+    "ethereum_slot_seconds": 12,
+    "target_block_gas": 30000000,
+    "block_gas_limit": 60000000,
+    "reference_withdrawal_gas": 652390,
+    "target_withdrawals_per_block": 45,
+    "maximum_withdrawals_per_block": 91,
+    "reference_withdrawal_tx": "0xf5be8392858d7a63813ca0ebeb4fb4fe173fd694feba24ef7180635433d630fd",
+    "optional_direct_withdrawal_gas": 587069,
+    "optional_direct_maximum_withdrawals_per_block": 102,
+    "optional_direct_withdrawal_tx": "0xe894abc79ca19fae8e3ef2a98b9570da0037d6f47ce531351002770d16ffe11f"
+  },
+  "workload": {
+    "adapter": "privacy_pool_withdrawal",
+    "adapter_schema_version": 1,
+    "proof_source": { "kind": "generated" },
+    "adapter_config": {
+      "tree_depth": 32,
+      "fixture_seed": 7,
+      "fixture_count": 102,
+      "hash": "blake2s_256"
+    },
+    "leaf_log_inv_rates": [1, 2, 3, 4]
+  },
+  "arrivals": {
+    "kind": "block_burst",
+    "period_seconds": 12,
+    "burst_count": 6,
+    "seed": 7,
+    "phases": [],
+    "sources": []
+  },
+  "root_policy": { "kind": "fixed_count" },
+  "root_lifecycle": "independent",
+  "deadlines": { "boundary": "serialized", "max_input_to_root_seconds": 12 },
+  "hardware_limits": {
+    "performance_workers": 8,
+    "efficiency_workers": 0,
+    "proving_processes": 1,
+    "prover_ram_bytes": 42949672960
+  },
+  "network": {
+    "connected_peers": 1,
+    "remote_input_fraction": 1,
+    "root_proof_recipients": 1,
+    "intermediate_proof_recipients": 0,
+    "ingress_budget_bytes_per_second": 1000000000000,
+    "egress_budget_bytes_per_second": 1000000000000,
+    "rolling_window_seconds": 1
+  },
+  "search": {
+    "inputs_per_root": [2, 4, 8, 16, 32, 45, 64, 91],
+    "optional_inputs_per_root": [102],
+    "arities": [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+    "nonfinal_rate_pairs": [
+      { "child_log_inv_rate": 1, "parent_log_inv_rate": 1 },
+      { "child_log_inv_rate": 2, "parent_log_inv_rate": 1 },
+      { "child_log_inv_rate": 3, "parent_log_inv_rate": 1 },
+      { "child_log_inv_rate": 4, "parent_log_inv_rate": 1 }
+    ],
+    "final_rate_pairs": [
+      { "child_log_inv_rate": 1, "parent_log_inv_rate": 1 },
+      { "child_log_inv_rate": 2, "parent_log_inv_rate": 1 },
+      { "child_log_inv_rate": 3, "parent_log_inv_rate": 1 },
+      { "child_log_inv_rate": 4, "parent_log_inv_rate": 1 },
+      { "child_log_inv_rate": 1, "parent_log_inv_rate": 2 },
+      { "child_log_inv_rate": 1, "parent_log_inv_rate": 3 },
+      { "child_log_inv_rate": 1, "parent_log_inv_rate": 4 }
+    ],
+    "primary_root_log_inv_rates": [1],
+    "compression_root_log_inv_rates": [2, 3, 4],
+    "diagnostic_rate_matrix_arities": [4],
+    "parent_measurement_mode": "adaptive",
+    "thread_scaling_arities": [4, 16]
+  }
+}

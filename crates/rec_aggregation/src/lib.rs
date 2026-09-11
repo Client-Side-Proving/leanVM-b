@@ -1,6 +1,5 @@
-//! Recursive XMSS aggregation ([`aggregation`]) and the harnesses that measure
-//! it ([`benchmark`]), plus the Fibonacci demo. One zkDSL guest
-//! (`guests/aggregate.py`) serves every node of an aggregation tree.
+//! Independent recursive XMSS and Privacy Pool withdrawal aggregation guests,
+//! their benchmark harnesses, and the Fibonacci demo.
 
 pub mod aggregation;
 pub mod benchmark;
@@ -11,6 +10,12 @@ pub mod fibonacci;
 /// with the other workloads.
 #[cfg(test)]
 mod hash_chain;
+pub mod privacy_pool;
+// This module keeps a mechanically aligned copy of the recursive verifier.
+// Some XMSS application helpers remain in that copy so protocol changes can be
+// applied and compared against the original implementation.
+#[allow(dead_code)]
+mod privacy_recursive;
 pub mod query;
 pub mod query_run;
 pub mod signers_cache;
@@ -20,9 +25,15 @@ pub use aggregation::{AggregateError, AggregateSignature, VerifyError, aggregate
 pub use benchmark::{run_recursion, run_xmss_aggregation};
 pub use capacity::run_capacity_case as run_recursion_capacity_case;
 pub use fibonacci::run_fibonacci;
+pub use privacy_pool::run_capacity_case as run_privacy_pool_capacity_case;
+pub use privacy_pool::{
+    Hash256, PrivacyError, PrivacyPoolProof, PrivacyPoolWorkloadAdapter, Withdrawal, WithdrawalFixture,
+    WithdrawalPublic, WithdrawalWitness,
+};
 pub use query::{
-    ArrivalConfig, ArrivalEvent, BenchmarkQuery, JobCost, ProofSource, RootBatch, RootLifecycle, RootPolicy,
-    TreeLevelPlan, TreePlan, arrival_events, close_root_batches, plan_tree,
+    ArrivalConfig, ArrivalEvent, BenchmarkAssumptions, BenchmarkQuery, JobCost, ProofSource, RatePair, RootBatch,
+    RootLifecycle, RootPolicy, TreeLevelPlan, TreePlan, arrival_events, close_root_batches, plan_tree,
+    plan_tree_with_rate_pairs,
 };
 pub use query_run::run_query_case as run_recursion_benchmark_case;
 pub use workload::{ProofMetadata, WorkloadAdapter, WorkloadDescription, XmssLeafSpec, XmssWorkloadAdapter};
