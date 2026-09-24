@@ -1180,17 +1180,26 @@ pub fn run_query_case(
     }
     eprintln!("LEANVM_BENCHMARK_PHASE=post_verification");
     for (record, (root, serialized)) in root_records.iter_mut().zip(&pending_verification) {
-        let verification_started = std::time::Instant::now();
+        let validation_started = std::time::Instant::now();
+        let in_memory_verification_started = std::time::Instant::now();
         let in_memory_result = root.verify_against(&expected);
+        let in_memory_verification_seconds = in_memory_verification_started.elapsed().as_secs_f64();
         record["in_memory_verify_ok"] = serde_json::json!(in_memory_result.is_ok());
+        let deserialization_started = std::time::Instant::now();
         let parsed = PrivacyPoolProof::from_bytes(serialized);
+        let deserialization_seconds = deserialization_started.elapsed().as_secs_f64();
         record["parse_ok"] = serde_json::json!(parsed.is_some());
+        let roundtrip_verification_started = std::time::Instant::now();
         let roundtrip_result = parsed
             .as_ref()
             .ok_or_else(|| PrivacyError::InvalidProof("serialized root proof did not parse".into()))
             .and_then(|parsed| parsed.verify_against(&expected));
+        let roundtrip_verification_seconds = roundtrip_verification_started.elapsed().as_secs_f64();
         record["roundtrip_verify_ok"] = serde_json::json!(roundtrip_result.is_ok());
-        record["native_verification_seconds"] = serde_json::json!(verification_started.elapsed().as_secs_f64());
+        record["native_in_memory_verification_seconds"] = serde_json::json!(in_memory_verification_seconds);
+        record["native_deserialization_seconds"] = serde_json::json!(deserialization_seconds);
+        record["native_roundtrip_verification_seconds"] = serde_json::json!(roundtrip_verification_seconds);
+        record["native_validation_seconds"] = serde_json::json!(validation_started.elapsed().as_secs_f64());
         if let Err(error) = in_memory_result.and(roundtrip_result) {
             record["status"] = serde_json::json!("failed");
             record["error"] = serde_json::json!(error.to_string());

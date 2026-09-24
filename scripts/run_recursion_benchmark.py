@@ -24,7 +24,7 @@ from typing import Any, Iterable, Sequence
 
 
 SCHEMA_VERSION = 1
-RUNNER_VERSION = 3
+RUNNER_VERSION = 4
 BOUNDARY_REPEAT_FIX_FROM_RUNNER_BLAKE2S = "01d82e9e84da738929afadd3666b093c1de78eafbfbe6ce90151bf059393d35f"
 NATIVE_RUSTFLAGS = "-C target-cpu=native"
 TIERS = {
@@ -62,8 +62,14 @@ SCHEMA2_CANDIDATE_FIELDS = [
     "post_run_verification_peak_rss_bytes",
     "peak_rss_bytes",
     "max_serialized_root_proof_bytes",
-    "median_native_root_verify_seconds",
-    "max_native_root_verify_seconds",
+    "median_native_root_in_memory_verification_seconds",
+    "max_native_root_in_memory_verification_seconds",
+    "median_native_root_deserialization_seconds",
+    "max_native_root_deserialization_seconds",
+    "median_native_root_roundtrip_verification_seconds",
+    "max_native_root_roundtrip_verification_seconds",
+    "median_native_root_validation_seconds",
+    "max_native_root_validation_seconds",
     "all_roots_verified_against_expected",
     "all_job_costs_directly_measured",
     "pass",
@@ -105,7 +111,10 @@ SCHEMA2_ROOT_FIELDS = [
     "root_serialized_unix_seconds",
     "root_interval_seconds",
     "proving_and_verification_seconds",
-    "native_root_verify_seconds",
+    "native_root_in_memory_verification_seconds",
+    "native_root_deserialization_seconds",
+    "native_root_roundtrip_verification_seconds",
+    "native_root_validation_seconds",
     "preparation_peak_rss_bytes",
     "timed_proving_peak_rss_bytes",
     "post_run_verification_peak_rss_bytes",
@@ -150,6 +159,32 @@ class RamLimitExceeded(RuntimeError):
     def __init__(self, peak_rss_bytes: int):
         super().__init__(f"prover RAM limit exceeded at {peak_rss_bytes} bytes")
         self.peak_rss_bytes = peak_rss_bytes
+
+
+NATIVE_ROOT_TIMING_FIELDS = (
+    ("in_memory_verification", "native_in_memory_verification_seconds"),
+    ("deserialization", "native_deserialization_seconds"),
+    ("roundtrip_verification", "native_roundtrip_verification_seconds"),
+    ("validation", "native_validation_seconds"),
+)
+
+
+def summarize_native_root_timings(roots: Sequence[dict[str, Any]]) -> dict[str, float | None]:
+    """Summarize each separately timed native root-validation operation."""
+    summary: dict[str, float | None] = {}
+    for label, source_field in NATIVE_ROOT_TIMING_FIELDS:
+        values = [float(root[source_field]) for root in roots if root.get(source_field) is not None]
+        summary[f"median_native_root_{label}_seconds"] = statistics.median(values) if values else None
+        summary[f"max_native_root_{label}_seconds"] = max(values, default=None)
+    return summary
+
+
+def native_root_timing_fields(root: dict[str, Any]) -> dict[str, Any]:
+    """Map adapter timing names to the root artifact schema."""
+    return {
+        f"native_root_{label}_seconds": root.get(source_field)
+        for label, source_field in NATIVE_ROOT_TIMING_FIELDS
+    }
 
 
 def percentile_nearest_rank(values: Sequence[float], fraction: float) -> float:
@@ -1828,6 +1863,44 @@ def schema2_root_target(smoke: bool) -> int:
     return 1 if smoke else 6
 
 
+def schema2_plan_filename(
+    phase: str,
+    inputs_per_root: int,
+    leaf_log_inv_rate: int,
+    root_log_inv_rate: int,
+    performance_workers: int,
+) -> str:
+    """Return the worker-specific filename for one resolved recursion plan."""
+    return (
+        f"{phase}-{inputs_per_root}-{leaf_log_inv_rate}-{root_log_inv_rate}"
+        f"-w{performance_workers}.json"
+    )
+
+
+def schema2_plan_digest(plan: dict[str, Any]) -> str:
+    """Hash a resolved recursion plan using the digest stored in candidate records."""
+    return hashlib.sha256(
+        json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def load_schema2_plan(
+    path: Path,
+    expected_digest: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Load a recursion plan and optionally check its recorded candidate digest."""
+    plan = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(plan, dict):
+        raise ValueError(f"schema-2 plan must be a JSON object: {path}")
+    actual_digest = schema2_plan_digest(plan)
+    if expected_digest is not None and actual_digest != expected_digest:
+        raise ValueError(
+            f"schema-2 plan digest mismatch for {path.name}: "
+            f"expected {expected_digest}, got {actual_digest}"
+        )
+    return plan, actual_digest
+
+
 def schema2_plan_manifests(
     output_dir: Path,
     query: dict[str, Any],
@@ -2696,12 +2769,55 @@ def run_schema2_campaign(query_path: Path, query: dict[str, Any], output_dir: Pa
                 if allowed <= 0:
                     pending.append({"key": key, "state": "pending", "reason": "time budget reserve"})
                     continue
-                plan_path = output_dir / "plans" / f"{phase}-{n}-{leaf_rate}-{root_rate}.json"
+                plan_path = output_dir / "plans" / schema2_plan_filename(
+                    phase,
+                    n,
+                    leaf_rate,
+                    root_rate,
+                    worker,
+                )
                 plan_path.parent.mkdir(parents=True, exist_ok=True)
                 if phase == "compression" and not smoke:
-                    baseline_path = output_dir / "plans" / f"primary-{n}-{leaf_rate}-1.json"
+                    baseline_path = output_dir / "plans" / schema2_plan_filename(
+                        "primary",
+                        n,
+                        leaf_rate,
+                        1,
+                        worker,
+                    )
                     if not baseline_path.exists():
                         pending.append({"key": key, "state": "pending", "reason": "baseline plan is missing"})
+                        continue
+                    baseline_candidate = next((
+                        candidate
+                        for candidate in reversed(candidates)
+                        if candidate.get("phase") == "primary"
+                        and int(candidate.get("inputs_per_root", -1)) == n
+                        and int(candidate.get("leaf_log_inv_rate", -1)) == leaf_rate
+                        and int(candidate.get("required_root_log_inv_rate", -1)) == 1
+                        and int(candidate.get("performance_workers", -1)) == worker
+                    ), None)
+                    baseline_digest = None if baseline_candidate is None else baseline_candidate.get(
+                        "executed_plan_digest"
+                    )
+                    if not baseline_digest:
+                        pending.append({
+                            "key": key,
+                            "state": "pending",
+                            "reason": "baseline plan digest is missing",
+                        })
+                        continue
+                    try:
+                        original_baseline, _ = load_schema2_plan(
+                            baseline_path,
+                            str(baseline_digest),
+                        )
+                    except (json.JSONDecodeError, OSError, ValueError) as error:
+                        pending.append({
+                            "key": key,
+                            "state": "failed",
+                            "reason": f"baseline plan: {error}",
+                        })
                         continue
                     final_parent_record = measure_compressed_final_parent(
                         baseline_path, n, leaf_rate, root_rate, worker
@@ -2713,7 +2829,6 @@ def run_schema2_campaign(query_path: Path, query: dict[str, Any], output_dir: Pa
                             "reason": "compressed final-parent capacity measurement is unavailable",
                         })
                         continue
-                    original_baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
                     baseline = json.loads(json.dumps(original_baseline))
                     if not baseline.get("levels"):
                         raise ValueError("compression baseline plan has no recursive levels")
@@ -2721,9 +2836,7 @@ def run_schema2_campaign(query_path: Path, query: dict[str, Any], output_dir: Pa
                     baseline["levels"][-1]["parent_log_inv_rate"] = root_rate
                     baseline["root_log_inv_rate"] = root_rate
                     baseline["query_blake2s"] = query_blake2s
-                    baseline["baseline_plan_digest"] = hashlib.sha256(
-                        json.dumps(original_baseline, sort_keys=True, separators=(",", ":")).encode()
-                    ).hexdigest()
+                    baseline["baseline_plan_digest"] = schema2_plan_digest(original_baseline)
                     final_level = baseline["levels"][-1]
                     final_level["estimated_service_seconds"] = float(
                         final_parent_record["mean_service_seconds"]
@@ -2777,14 +2890,7 @@ def run_schema2_campaign(query_path: Path, query: dict[str, Any], output_dir: Pa
                         continue
                     plan_record["query_blake2s"] = query_blake2s
                     write_json(plan_path, plan_record)
-                plan_digest = hashlib.sha256(
-                    json.dumps(
-                        json.loads(plan_path.read_text(encoding="utf-8")),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode()
-                ).hexdigest()
-                executed_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                executed_plan, plan_digest = load_schema2_plan(plan_path)
                 schema2_plan_manifests(
                     output_dir,
                     query,
@@ -2878,11 +2984,6 @@ def run_schema2_campaign(query_path: Path, query: dict[str, Any], output_dir: Pa
                     for root in roots_for_candidate
                     if root.get("root_interval_seconds") is not None
                 ]
-                native_times = [
-                    float(root["native_verification_seconds"])
-                    for root in roots_for_candidate
-                    if root.get("native_verification_seconds") is not None
-                ]
                 actual_rates = {int(root["actual_root_log_inv_rate"]) for root in roots_for_candidate}
                 phase_rss = {
                     name: max((int(root.get(name, 0)) for root in roots_for_candidate), default=0)
@@ -2916,8 +3017,7 @@ def run_schema2_campaign(query_path: Path, query: dict[str, Any], output_dir: Pa
                         (int(root["serialized_root_proof_bytes"]) for root in roots_for_candidate),
                         default=None,
                     ),
-                    "median_native_root_verify_seconds": statistics.median(native_times) if native_times else None,
-                    "max_native_root_verify_seconds": max(native_times, default=None),
+                    **summarize_native_root_timings(roots_for_candidate),
                     "all_roots_verified_against_expected": complete,
                     "all_job_costs_directly_measured": bool(
                         executed_plan.get("all_job_costs_directly_measured", False)
@@ -2938,7 +3038,7 @@ def run_schema2_campaign(query_path: Path, query: dict[str, Any], output_dir: Pa
                     root = {"candidate_id": row["candidate_attempt_id"], "root_index": index,
                             "executed_plan_digest": plan_digest,
                             "baseline_plan_digest": executed_plan.get("baseline_plan_digest"),
-                            "native_root_verify_seconds": result.get("native_verification_seconds"),
+                            **native_root_timing_fields(result),
                             **result}
                     roots.append(root)
                     append_jsonl(raw_path, {"record_type": "root", "root": root})
@@ -2978,13 +3078,30 @@ def run_schema2_campaign(query_path: Path, query: dict[str, Any], output_dir: Pa
         exact_shapes = set()
         for n in (45, 91):
             for leaf_rate in rates:
-                plan_path = output_dir / "plans" / f"primary-{n}-{leaf_rate}-1.json"
+                primary_candidate = next((
+                    candidate
+                    for candidate in reversed(candidates)
+                    if candidate.get("phase") == "primary"
+                    and int(candidate.get("inputs_per_root", -1)) == n
+                    and int(candidate.get("leaf_log_inv_rate", -1)) == leaf_rate
+                    and int(candidate.get("required_root_log_inv_rate", -1)) == 1
+                    and int(candidate.get("performance_workers", -1)) == workers[0]
+                ), None)
+                if primary_candidate is None or not primary_candidate.get("executed_plan_digest"):
+                    continue
+                plan_path = output_dir / "plans" / schema2_plan_filename(
+                    "primary",
+                    n,
+                    leaf_rate,
+                    1,
+                    workers[0],
+                )
                 if not plan_path.exists():
                     continue
-                plan = json.loads(plan_path.read_text(encoding="utf-8"))
-                plan_digest = hashlib.sha256(
-                    json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()
-                ).hexdigest()
+                plan, plan_digest = load_schema2_plan(
+                    plan_path,
+                    str(primary_candidate["executed_plan_digest"]),
+                )
                 for path in sorted((output_dir / "parent-cases" / "plan" / plan_digest).glob("level/*/job/*.json")):
                     manifest = json.loads(path.read_text(encoding="utf-8"))
                     shape_key = hashlib.blake2s(json.dumps({
@@ -3318,7 +3435,7 @@ def run_schema2_campaign(query_path: Path, query: dict[str, Any], output_dir: Pa
         "Workload: Privacy Pool withdrawal, two depth-32 Merkle paths, BLAKE2s-256.",
         f"Timing boundary: serialized input-to-root with a {query['assumptions']['ethereum_slot_seconds']}-second block period.",
         "Each screening candidate uses six roots; smoke mode uses one root.",
-        "Final native verification is measured after all roots serialize and is excluded from input-to-root latency.",
+        "Native root validation is measured after all roots serialize and is excluded from input-to-root latency.",
         "",
         "## Missing points",
         "",

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -15,6 +16,30 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"expected a JSON object in {path}")
     return value
+
+
+def read_raw_records(input_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    candidates: list[dict[str, Any]] = []
+    roots: list[dict[str, Any]] = []
+    raw_path = input_dir / "raw.jsonl"
+    for line_number, line in enumerate(raw_path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        value = json.loads(line)
+        if not isinstance(value, dict):
+            raise ValueError(f"expected a JSON object in {raw_path}:{line_number}")
+        record_type = value.get("record_type")
+        if record_type == "candidate":
+            candidate = value.get("candidate")
+            if not isinstance(candidate, dict):
+                raise ValueError(f"candidate record is missing candidate in {raw_path}:{line_number}")
+            candidates.append(candidate)
+        elif record_type == "root":
+            root = value.get("root")
+            if not isinstance(root, dict):
+                raise ValueError(f"root record is missing root in {raw_path}:{line_number}")
+            roots.append(root)
+    return candidates, roots
 
 
 def candidate_rank(candidate: dict[str, Any], index: int) -> tuple[int, int, int]:
@@ -45,14 +70,89 @@ def load_leaf_proof_sizes(input_dir: Path) -> dict[tuple[int, int], int]:
     return sizes
 
 
+def schema2_plan_digest(plan: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def load_tree_from_manifests(
+    input_dir: Path, candidate: dict[str, Any]
+) -> dict[str, Any] | None:
+    expected_digest = candidate.get("executed_plan_digest")
+    if not expected_digest:
+        return None
+    level_root = input_dir / "parent-cases" / "plan" / str(expected_digest) / "level"
+    if not level_root.is_dir():
+        return None
+    level_dirs = sorted(
+        (path for path in level_root.iterdir() if path.is_dir() and path.name.isdigit()),
+        key=lambda path: int(path.name),
+    )
+    if [int(path.name) for path in level_dirs] != list(range(len(level_dirs))):
+        return None
+    input_count = int(candidate["inputs_per_root"])
+    levels = []
+    for level_index, level_dir in enumerate(level_dirs):
+        jobs: dict[int, int] = {}
+        child_rates: set[int] = set()
+        parent_rates: set[int] = set()
+        for manifest_path in (level_dir / "job").glob("*.json"):
+            if not manifest_path.stem.isdigit():
+                return None
+            manifest = read_json(manifest_path)
+            if manifest.get("executed_plan_digest") != expected_digest:
+                return None
+            configuration = manifest.get("configuration")
+            children = manifest.get("children")
+            if not isinstance(configuration, dict) or not isinstance(children, list):
+                return None
+            output_index = int(manifest_path.stem)
+            arity = int(configuration["arity"])
+            if output_index in jobs or arity != len(children) or arity < 2:
+                return None
+            jobs[output_index] = arity
+            child_rates.add(int(configuration["child_log_inv_rate"]))
+            parent_rates.add(int(configuration["parent_log_inv_rate"]))
+        if not jobs or len(child_rates) != 1 or len(parent_rates) != 1:
+            return None
+        output_count = input_count - sum(arity - 1 for arity in jobs.values())
+        if output_count <= 0 or max(jobs) >= output_count:
+            return None
+        child_counts = [jobs.get(index, 1) for index in range(output_count)]
+        if sum(child_counts) != input_count:
+            return None
+        levels.append({
+            "level": level_index + 1,
+            "isRoot": output_count == 1,
+            "inputCount": input_count,
+            "outputCount": output_count,
+            "childCounts": child_counts,
+            "childRate": next(iter(child_rates)),
+            "parentRate": next(iter(parent_rates)),
+            "estimatedSeconds": None,
+        })
+        input_count = output_count
+    if not levels or levels[-1]["outputCount"] != 1:
+        return None
+    return {
+        "levels": levels,
+        "estimatedSeconds": None,
+        "levelTimesEstimated": False,
+    }
+
+
 def load_tree_plan(input_dir: Path, candidate: dict[str, Any]) -> dict[str, Any] | None:
     plan_path = candidate.get("plan_path")
     if not plan_path:
-        return None
+        return load_tree_from_manifests(input_dir, candidate)
     local_path = input_dir / "plans" / Path(str(plan_path)).name
     if not local_path.exists():
-        return None
+        return load_tree_from_manifests(input_dir, candidate)
     plan = read_json(local_path)
+    expected_digest = candidate.get("executed_plan_digest")
+    if expected_digest and schema2_plan_digest(plan) != expected_digest:
+        return load_tree_from_manifests(input_dir, candidate)
     levels = []
     for index, level in enumerate(plan.get("levels", [])):
         levels.append({
@@ -68,7 +168,33 @@ def load_tree_plan(input_dir: Path, candidate: dict[str, Any]) -> dict[str, Any]
     return {
         "levels": levels,
         "estimatedSeconds": float(plan.get("estimated_service_seconds", 0)),
+        "levelTimesEstimated": True,
     }
+
+
+def backlog_at_next_block(
+    roots: list[dict[str, Any]], block_period_seconds: float
+) -> int | None:
+    """Count measured roots still pending when the next block would arrive."""
+    if not roots:
+        return None
+    arrivals = []
+    completions = []
+    for root in roots:
+        arrival = root.get("burst_arrival_seconds")
+        if arrival is None:
+            return None
+        arrival = float(arrival)
+        completion = root.get("campaign_elapsed_at_serialization_seconds")
+        if completion is None:
+            latency = root.get("serialized_input_to_root_seconds")
+            if latency is None:
+                return None
+            completion = arrival + float(latency)
+        arrivals.append(arrival)
+        completions.append(float(completion))
+    next_block_arrival = max(arrivals) + block_period_seconds
+    return sum(completion > next_block_arrival for completion in completions)
 
 
 def compact_candidate(
@@ -76,6 +202,8 @@ def compact_candidate(
     leaf_sizes: dict[tuple[int, int], int],
     roots: list[dict[str, Any]],
     input_dir: Path,
+    source_index: int,
+    block_period_seconds: float,
 ) -> dict[str, Any]:
     peak_rss = candidate.get("peak_rss_bytes")
     proof_bytes = candidate.get("max_serialized_root_proof_bytes")
@@ -85,22 +213,18 @@ def compact_candidate(
     child_proof_bytes = sum(proof_sizes) if all(size is not None for size in proof_sizes) else None
     candidate_id = str(candidate["candidate_attempt_id"])
     plan_digest = candidate.get("executed_plan_digest")
-    candidate_roots = [
-        root
+    candidate_roots_by_index = {
+        int(root["root_index"]): root
         for root in roots
         if root.get("candidate_id") == candidate_id
         and root.get("status") == "success"
         and (plan_digest is None or root.get("executed_plan_digest") == plan_digest)
-    ]
+    }
+    candidate_roots = [candidate_roots_by_index[index] for index in sorted(candidate_roots_by_index)]
     input_to_root_seconds = [
         float(root["serialized_input_to_root_seconds"])
         for root in candidate_roots
         if root.get("serialized_input_to_root_seconds") is not None
-    ]
-    root_intervals = [
-        float(root["root_interval_seconds"])
-        for root in candidate_roots
-        if root.get("root_interval_seconds") is not None
     ]
     proving_seconds = [
         float(root["proving_and_verification_seconds"]) + float(root["serialization_seconds"])
@@ -108,19 +232,21 @@ def compact_candidate(
         if root.get("proving_and_verification_seconds") is not None
         and root.get("serialization_seconds") is not None
     ]
+    report_id = hashlib.sha256(
+        f"{source_index}:{candidate_id}:{plan_digest or 'no-plan'}".encode()
+    ).hexdigest()
     compact = {
-        "id": candidate_id,
-        "phase": candidate["phase"],
+        "id": report_id,
         "proofs": proofs,
         "leafRate": leaf_rate,
         "rootRate": int(candidate["required_root_log_inv_rate"]),
         "workers": int(candidate["performance_workers"]),
         "complete": candidate.get("terminal_status") == "success",
-        "completedRoots": int(candidate.get("completed_roots", 0)),
+        "completedRoots": len(candidate_roots),
         "verified": bool(candidate.get("all_roots_verified_against_expected")),
         "maxLatency": candidate.get("max_serialized_input_to_root_seconds"),
         "meanLatency": None if not input_to_root_seconds else sum(input_to_root_seconds) / len(input_to_root_seconds),
-        "meanRootInterval": None if not root_intervals else sum(root_intervals) / len(root_intervals),
+        "backlogAtNextBlock": backlog_at_next_block(candidate_roots, block_period_seconds),
         "meanProvingSeconds": None if not proving_seconds else sum(proving_seconds) / len(proving_seconds),
         "peakRssGiB": None if peak_rss is None else int(peak_rss) / (1 << 30),
         "rootProofBytes": None if proof_bytes is None else int(proof_bytes),
@@ -132,27 +258,63 @@ def compact_candidate(
     return compact
 
 
-def build_payload(input_dir: Path, hardware_description: str) -> dict[str, Any]:
-    candidates_doc = read_json(input_dir / "candidates.json")
+def compatible_query_fields(query: dict[str, Any]) -> dict[str, Any]:
+    hardware = query["hardware_limits"]
+    return {
+        "schema_version": query["schema_version"],
+        "workload": query["workload"],
+        "arrivals": query["arrivals"],
+        "root_policy": query["root_policy"],
+        "root_lifecycle": query["root_lifecycle"],
+        "deadlines": query["deadlines"],
+        "network": query["network"],
+        "performance_workers": hardware["performance_workers"],
+        "efficiency_workers": hardware["efficiency_workers"],
+        "proving_processes": hardware["proving_processes"],
+    }
+
+
+def build_payload(input_dirs: list[Path], hardware_description: str) -> dict[str, Any]:
+    if not input_dirs:
+        raise ValueError("at least one benchmark directory is required")
+    input_dir = input_dirs[0]
     capacity = read_json(input_dir / "capacity.json")
     query = read_json(input_dir / "query.json")
-    summary = read_json(input_dir / "summary.json")
-    raw_candidates = candidates_doc.get("candidates")
-    if not isinstance(raw_candidates, list):
-        raise ValueError("candidates.json is missing candidates")
-    roots = summary.get("roots")
-    if not isinstance(roots, list):
-        raise ValueError("summary.json is missing roots")
+    expected_query = compatible_query_fields(query)
     leaf_sizes = load_leaf_proof_sizes(input_dir)
-    compact = [compact_candidate(candidate, leaf_sizes, roots, input_dir) for candidate in canonical_candidates(raw_candidates)]
-    compact.sort(key=lambda row: ({"primary": 0, "scaling": 1, "compression": 2}.get(row["phase"], 9), row["proofs"], row["leafRate"], -row["workers"], row["rootRate"]))
-    for candidate in compact:
-        candidate.pop("phase")
+    roots_per_candidate = int(query["arrivals"]["burst_count"])
+    block_period_seconds = float(query["arrivals"]["period_seconds"])
+    compact: list[dict[str, Any]] = []
+    for source_index, source_dir in enumerate(input_dirs):
+        source_query = read_json(source_dir / "query.json")
+        if compatible_query_fields(source_query) != expected_query:
+            raise ValueError(f"incompatible benchmark query in {source_dir}")
+        raw_candidates, roots = read_raw_records(source_dir)
+        for candidate in canonical_candidates(raw_candidates):
+            row = compact_candidate(
+                candidate,
+                leaf_sizes,
+                roots,
+                source_dir,
+                source_index,
+                block_period_seconds,
+            )
+            if row["complete"] and row["completedRoots"] >= roots_per_candidate and row["verified"]:
+                compact.append(row)
+    compact.sort(
+        key=lambda row: (
+            row["proofs"],
+            row["leafRate"],
+            row["rootRate"],
+            -row["workers"],
+            row["peakRssGiB"],
+            row["maxLatency"],
+        )
+    )
 
     workload = query["workload"]["adapter_config"]
     hardware = query["hardware_limits"]
     network = query["network"]
-    arrivals = query["arrivals"]
     geometry = []
     for record in capacity.get("parent_jobs", []):
         if record.get("measurement_phase") != "geometry" or int(record.get("performance_workers", 0)) != 1:
@@ -168,8 +330,8 @@ def build_payload(input_dir: Path, hardware_description: str) -> dict[str, Any]:
 
     return {
         "deadlineSeconds": float(query["deadlines"]["max_input_to_root_seconds"]),
-        "blockPeriodSeconds": float(arrivals["period_seconds"]),
-        "rootsPerCandidate": int(arrivals["burst_count"]),
+        "blockPeriodSeconds": block_period_seconds,
+        "rootsPerCandidate": roots_per_candidate,
         "treeDepth": int(workload["tree_depth"]),
         "hash": workload["hash"],
         "hardware": {
@@ -282,7 +444,7 @@ select { min-width:130px; padding:7px 30px 7px 9px; border:1px solid var(--line)
   </header>
   <nav class="tabs" role="tablist" aria-label="Report sections">
     <button type="button" role="tab" aria-selected="true" aria-controls="overview">Capacity</button>
-    <button type="button" role="tab" aria-selected="false" aria-controls="candidates">All candidates</button>
+    <button type="button" role="tab" aria-selected="false" aria-controls="candidates">Measurements</button>
     <button type="button" role="tab" aria-selected="false" aria-controls="geometry">Parent geometry</button>
   </nav>
   <section class="tab-panel" id="overview" role="tabpanel">
@@ -314,7 +476,7 @@ select { min-width:130px; padding:7px 30px 7px 9px; border:1px solid var(--line)
       <section class="card table-card"><div class="table-title"><h2>Why the next larger batch fails</h2></div><div class="table-wrap"><table id="next-capacity-table"></table></div></section>
     </div>
     <section class="card table-card section"><div class="table-title"><h2>Selected aggregation tree</h2><p id="tree-note"></p></div><div class="table-wrap"><table id="tree-table"></table></div></section>
-    <p class="footnote">Each result covers six block arrivals, 12 seconds apart. At each arrival, all proofs for that block are supplied together; a root does not wait for proofs from later blocks. A configuration sustains one root per block when the average interval between serialized roots is at most 12 seconds. The selected input-to-root limit caps each block's queueing, proving, and serialization time. Ethereum inclusion of the root is outside this benchmark. Child proofs are prepared before timing starts. All serialized child proofs are counted as downloads. Each serialized root proof is counted once per recipient as an upload. The benchmark calculates network requirements from proof sizes; it does not transmit data over a network.</p>
+    <p class="footnote">Each result covers six block arrivals, 12 seconds apart. At each arrival, all proofs for that block are supplied together; a root does not wait for proofs from later blocks. A configuration is admitted when every measured batch meets the selected input-to-root limit and all six roots are complete before the next block arrival. Ethereum inclusion of the root is outside this benchmark. Child proofs are prepared before timing starts. All serialized child proofs are counted as downloads. Each serialized root proof is counted once per recipient as an upload. The benchmark calculates network requirements from proof sizes; it does not transmit data over a network.</p>
   </section>
   <section class="tab-panel" id="candidates" role="tabpanel" hidden>
     <section class="card table-card"><div class="filters"><label>Proofs per root<select id="proofs-filter"></select></label><label>Leaf WHIR rate<select id="leaf-filter"></select></label><label>Performance threads<select id="workers-filter"></select></label></div><div class="table-wrap"><table id="candidate-table"></table></div></section>
@@ -335,20 +497,20 @@ const maxLatency=Math.ceil(Math.max(...DATA.candidates.map(row=>Number(row.maxLa
 const state={workers:DATA.hardware.performanceWorkers,deadline:DATA.deadlineSeconds,ramGiB:DATA.hardware.ramLimitGiB,connectedPeers:DATA.network.connectedPeers,rootRecipients:DATA.network.rootProofRecipients,ingressMbps:300,egressMbps:300};
 
 function formatRate(value){if(value>=1e6)return`${fmt(value/1e6,2)} Tbit/s`;if(value>=1e3)return`${fmt(value/1e3,2)} Gbit/s`;return`${fmt(value,value<10?2:1)} Mbit/s`;}
-function intrinsicPass(row){return row.complete&&row.completedRoots>=DATA.rootsPerCandidate&&row.verified&&row.maxLatency!=null&&row.meanLatency!=null&&row.meanRootInterval!=null&&row.peakRssGiB!=null&&row.rootProofBytes!=null&&row.childProofBytes!=null;}
+function intrinsicPass(row){return row.complete&&row.completedRoots>=DATA.rootsPerCandidate&&row.verified&&row.maxLatency!=null&&row.meanLatency!=null&&row.backlogAtNextBlock!=null&&row.peakRssGiB!=null&&row.rootProofBytes!=null&&row.childProofBytes!=null;}
 function networkMetrics(row){const ingressBytes=row.childProofBytes,egressBytes=row.rootProofBytes*state.rootRecipients;return{maximumIngress:ingressBytes*8/1e6/DATA.network.rollingWindowSeconds,maximumEgress:egressBytes*8/1e6/DATA.network.rollingWindowSeconds};}
 function checks(row){const network=networkMetrics(row);return[
   {label:"Performance threads",measured:row.workers,limit:state.workers,unit:"threads",digits:0,pass:row.workers<=state.workers},
   {label:"Peak RSS",measured:row.peakRssGiB,limit:state.ramGiB,unit:"GiB",digits:2,pass:row.peakRssGiB<=state.ramGiB},
   {label:"Maximum input-to-root time",measured:row.maxLatency,limit:state.deadline,unit:"s",digits:3,pass:row.maxLatency<=state.deadline},
-  {label:"Average interval between roots",measured:row.meanRootInterval,limit:DATA.blockPeriodSeconds,unit:"s",digits:3,pass:row.meanRootInterval<=DATA.blockPeriodSeconds},
+  {label:"Roots pending at next block arrival",measured:row.backlogAtNextBlock,limit:0,unit:"roots",digits:0,pass:row.backlogAtNextBlock===0},
   {label:"Download required",measured:network.maximumIngress,limit:state.ingressMbps,unit:"Mbit/s",digits:2,pass:network.maximumIngress<=state.ingressMbps},
   {label:"Upload required",measured:network.maximumEgress,limit:state.egressMbps,unit:"Mbit/s",digits:2,pass:network.maximumEgress<=state.egressMbps}
 ];}
 function passes(row){return intrinsicPass(row)&&checks(row).every(check=>check.pass);}
 function winnerSort(a,b){return b.proofs-a.proofs||a.peakRssGiB-b.peakRssGiB||a.workers-b.workers||a.maxLatency-b.maxLatency||a.rootProofBytes-b.rootProofBytes;}
 function selectedCandidate(){return DATA.candidates.filter(passes).sort(winnerSort)[0]||null;}
-function checkValue(check,value){if(check.unit==="threads")return`${fmt(value,0)} ${Number(value)===1?'thread':'threads'}`;return`${fmt(value,check.digits)} ${check.unit}`;}
+function checkValue(check,value){if(check.unit==="threads")return`${fmt(value,0)} ${Number(value)===1?'thread':'threads'}`;if(check.unit==="roots")return`${fmt(value,0)} ${Number(value)===1?'root':'roots'}`;return`${fmt(value,check.digits)} ${check.unit}`;}
 function failedChecks(row){if(!intrinsicPass(row))return[row.reason||"Measurement did not complete"];return checks(row).filter(check=>!check.pass).map(check=>`${check.label}: ${checkValue(check,check.measured)} exceeds ${checkValue(check,check.limit)}`);}
 function nextLargerCandidate(selected){const sizes=[...new Set(DATA.candidates.filter(row=>intrinsicPass(row)&&row.workers<=state.workers&&row.proofs>selected.proofs).map(row=>row.proofs))].sort((a,b)=>a-b);if(!sizes.length)return null;const rows=DATA.candidates.filter(row=>row.proofs===sizes[0]&&intrinsicPass(row)&&row.workers<=state.workers);return rows.sort((a,b)=>failedChecks(a).length-failedChecks(b).length||a.maxLatency-b.maxLatency||a.peakRssGiB-b.peakRssGiB)[0]||null;}
 
@@ -364,7 +526,7 @@ function setupControls(){
 }
 function renderControlValues(){document.getElementById("workers-value").textContent=state.workers;document.getElementById("deadline-value").textContent=`${fmt(state.deadline,0)} s`;document.getElementById("ram-value").textContent=`${fmt(state.ramGiB,0)} GiB`;document.getElementById("peers-value").textContent=state.connectedPeers;document.getElementById("recipients-value").textContent=state.rootRecipients;document.getElementById("ingress-value").textContent=formatRate(state.ingressMbps);document.getElementById("egress-value").textContent=formatRate(state.egressMbps);}
 function renderStats(selected){
-  const cards=selected?[["Greatest tested batch meeting the selected limits",`${selected.proofs} proofs / root`,`Roots completed every ${fmt(selected.meanRootInterval)} s on average`],["Selected recursion parameters",`${selected.workers} threads · leaf WHIR rate ${rateLabel(selected.leafRate)}`,`Root WHIR rate ${rateLabel(selected.rootRate)}`],["Measured resource use",`${fmt(selected.maxLatency)} s max · ${fmt(selected.peakRssGiB,2)} GiB RSS`,`${formatRate(networkMetrics(selected).maximumIngress)} download required · ${formatRate(networkMetrics(selected).maximumEgress)} upload required`]]:[["Greatest tested batch meeting the selected limits","No measured configuration","Increase one or more selected limits to admit a completed candidate"],["Hardware",`${state.workers} threads · ${fmt(state.ramGiB,0)} GiB`,`${fmt(state.deadline,0)}-second input-to-root limit`],["Network",`${formatRate(state.ingressMbps)} download`,`${formatRate(state.egressMbps)} upload · ${state.rootRecipients} root recipient${state.rootRecipients===1?"":"s"}`]];
+  const cards=selected?[["Greatest tested batch meeting the selected limits",`${selected.proofs} proofs / root`,"No roots pending at the next block arrival"],["Selected recursion parameters",`${selected.workers} threads · leaf WHIR rate ${rateLabel(selected.leafRate)}`,`Root WHIR rate ${rateLabel(selected.rootRate)}`],["Measured resource use",`${fmt(selected.maxLatency)} s max · ${fmt(selected.peakRssGiB,2)} GiB RSS`,`${formatRate(networkMetrics(selected).maximumIngress)} download required · ${formatRate(networkMetrics(selected).maximumEgress)} upload required`]]:[["Greatest tested batch meeting the selected limits","No measured configuration","Increase one or more selected limits to admit a successful measurement"],["Hardware",`${state.workers} threads · ${fmt(state.ramGiB,0)} GiB`,`${fmt(state.deadline,0)}-second input-to-root limit`],["Network",`${formatRate(state.ingressMbps)} download`,`${formatRate(state.egressMbps)} upload · ${state.rootRecipients} root recipient${state.rootRecipients===1?"":"s"}`]];
   document.getElementById("stats").innerHTML=cards.map(([label,value,detail])=>`<article class="card stat"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div><div class="detail">${esc(detail)}</div></article>`).join("");
 }
 function scatterChart(selected){
@@ -376,13 +538,13 @@ function scatterChart(selected){
   for(const tick of yTicks)svg+=`<line class="grid" x1="${margin.left}" x2="${width-margin.right}" y1="${y(tick)}" y2="${y(tick)}"/><text class="axis-text" x="${margin.left-10}" y="${y(tick)+4}" text-anchor="end">${tick<10?fmt(tick,tick<1?1:0):Math.round(tick)}</text>`;
   for(const tick of xs)svg+=`<text class="axis-text" x="${x(tick)}" y="${height-margin.bottom+24}" text-anchor="middle">${tick}</text>`;
   svg+=`<line class="axis" x1="${margin.left}" x2="${width-margin.right}" y1="${height-margin.bottom}" y2="${height-margin.bottom}"/><line class="axis" x1="${margin.left}" x2="${margin.left}" y1="${margin.top}" y2="${height-margin.bottom}"/><line class="deadline" x1="${margin.left}" x2="${width-margin.right}" y1="${y(state.deadline)}" y2="${y(state.deadline)}"/><text x="${width-margin.right-2}" y="${Math.max(margin.top+12,y(state.deadline)-7)}" text-anchor="end" fill="var(--red)" font-size="12">Selected limit ${fmt(state.deadline,0)} s</text>`;
-  rows.forEach(row=>{const jitter=(row.leafRate-2.5)*3+(row.rootRate-1)*1.5+(8-row.workers)*.35,cx=x(row.proofs)+jitter,cy=y(row.maxLatency),ok=passes(row),isSelected=selected&&selected.id===row.id;if(isSelected)svg+=`<circle cx="${cx}" cy="${cy}" r="9" fill="none" stroke="var(--blue)" stroke-width="2.5"/>`;svg+=`<circle cx="${cx}" cy="${cy}" r="4.7" fill="${ok?'var(--green)':'var(--red)'}" stroke="var(--surface)" stroke-width="1.2"><title>${row.proofs} proofs/root · ${row.workers} threads · leaf ${rateLabel(row.leafRate)} · root ${rateLabel(row.rootRate)} · ${fmt(row.maxLatency)} s maximum input-to-root · ${fmt(row.meanRootInterval)} s average root interval · ${fmt(row.peakRssGiB,2)} GiB RSS · ${ok?'meets':'fails'} selected limits</title></circle>`;});
+  rows.forEach(row=>{const jitter=(row.leafRate-2.5)*3+(row.rootRate-1)*1.5+(8-row.workers)*.35,cx=x(row.proofs)+jitter,cy=y(row.maxLatency),ok=passes(row),isSelected=selected&&selected.id===row.id;if(isSelected)svg+=`<circle cx="${cx}" cy="${cy}" r="9" fill="none" stroke="var(--blue)" stroke-width="2.5"/>`;svg+=`<circle cx="${cx}" cy="${cy}" r="4.7" fill="${ok?'var(--green)':'var(--red)'}" stroke="var(--surface)" stroke-width="1.2"><title>${row.proofs} proofs/root · ${row.workers} threads · leaf ${rateLabel(row.leafRate)} · root ${rateLabel(row.rootRate)} · ${fmt(row.maxLatency)} s maximum input-to-root · ${fmt(row.backlogAtNextBlock,0)} roots pending at next block arrival · ${fmt(row.peakRssGiB,2)} GiB RSS · ${ok?'meets':'fails'} selected limits</title></circle>`;});
   svg+=`<text class="axis-title" x="${margin.left+innerW/2}" y="${height-10}" text-anchor="middle">Proofs aggregated into one block root</text><text class="axis-title" transform="translate(17 ${margin.top+innerH/2}) rotate(-90)" text-anchor="middle">Maximum input-to-root time (seconds)</text></svg>`;document.getElementById("capacity-chart").innerHTML=svg;
 }
 function resourceMetrics(){return[
   {key:"threads",title:"Performance threads",unit:"threads",digits:0,value:row=>row.workers,limit:()=>state.workers},
   {key:"memory",title:"Peak RSS",unit:"GiB",digits:2,value:row=>row.peakRssGiB,limit:()=>state.ramGiB},
-  {key:"root-interval",title:"Average interval between roots",unit:"seconds",digits:3,value:row=>row.meanRootInterval,limit:()=>DATA.blockPeriodSeconds},
+  {key:"backlog",title:"Roots pending at next block arrival",unit:"roots",digits:0,value:row=>row.backlogAtNextBlock,limit:()=>0},
   {key:"download",title:"Download required",unit:"Mbit/s",digits:2,logarithmic:true,value:row=>row.childProofBytes==null?null:networkMetrics(row).maximumIngress,limit:()=>state.ingressMbps},
   {key:"upload",title:"Upload required",unit:"Mbit/s",digits:2,logarithmic:true,value:row=>row.rootProofBytes==null?null:networkMetrics(row).maximumEgress,limit:()=>state.egressMbps}
 ];}
@@ -405,11 +567,11 @@ function resourceChart(target,metric,selected){
 function renderResourceCharts(selected){const metrics=resourceMetrics(),target=document.getElementById("resource-charts");target.innerHTML=metrics.map(metric=>`<article class="card resource-chart"><h3>${esc(metric.title)}</h3><div class="chart" id="resource-${metric.key}"></div></article>`).join("");metrics.forEach(metric=>resourceChart(`resource-${metric.key}`,metric,selected));}
 function table(headers,rows){return`<thead><tr>${headers.map(header=>`<th class="${header.numeric?"num":""}">${esc(header.label)}</th>`).join("")}</tr></thead><tbody>${rows.map(row=>`<tr>${row.map((cell,index)=>`<td class="${headers[index].numeric?"num":""}">${cell}</td>`).join("")}</tr>`).join("")}</tbody>`;}
 function renderLimits(selected){const target=document.getElementById("limits-table");if(!selected){target.innerHTML=table([{label:"Result"}],[[`<span class="na">No configuration meets the selected limits.</span>`]]);return;}target.innerHTML=table([{label:"Quantity"},{label:"Measured",numeric:true},{label:"Selected limit",numeric:true},{label:"Result"}],checks(selected).map(check=>[esc(check.label),esc(checkValue(check,check.measured)),esc(checkValue(check,check.limit)),`<span class="result ${check.pass?'pass':'fail'}">${check.pass?'within limit':'over limit'}</span>`]));}
-function renderNextCapacity(selected){const target=document.getElementById("next-capacity-table");if(!selected){target.innerHTML=table([{label:"Result"}],[[`<span class="na">Select limits that admit a configuration.</span>`]]);return;}const next=nextLargerCandidate(selected);if(!next){target.innerHTML=table([{label:"Result"}],[[`<span class="na">No larger completed configuration was measured within the selected thread limit.</span>`]]);return;}const failures=failedChecks(next);target.innerHTML=table([{label:"Batch"},{label:"Configuration"},{label:"Measured"},{label:"Limits exceeded"}],[[`${next.proofs} proofs/root`,`${next.workers} threads · leaf WHIR ${rateLabel(next.leafRate)} · root WHIR ${rateLabel(next.rootRate)}`,`${fmt(next.maxLatency)} s maximum input-to-root · ${fmt(next.meanRootInterval)} s average root interval · ${fmt(next.peakRssGiB,2)} GiB RSS`,failures.length?esc(failures.join("; ")):`<span class="pass">None</span>`]]);}
+function renderNextCapacity(selected){const target=document.getElementById("next-capacity-table");if(!selected){target.innerHTML=table([{label:"Result"}],[[`<span class="na">Select limits that admit a configuration.</span>`]]);return;}const next=nextLargerCandidate(selected);if(!next){target.innerHTML=table([{label:"Result"}],[[`<span class="na">No larger successful measurement is available within the selected thread limit.</span>`]]);return;}const failures=failedChecks(next);target.innerHTML=table([{label:"Batch"},{label:"Configuration"},{label:"Measured"},{label:"Limits exceeded"}],[[`${next.proofs} proofs/root`,`${next.workers} threads · leaf WHIR ${rateLabel(next.leafRate)} · root WHIR ${rateLabel(next.rootRate)}`,`${fmt(next.maxLatency)} s maximum input-to-root · ${fmt(next.backlogAtNextBlock,0)} roots pending at next block arrival · ${fmt(next.peakRssGiB,2)} GiB RSS`,failures.length?esc(failures.join("; ")):`<span class="pass">None</span>`]]);}
 function populateSelect(id,values,formatter=value=>value){const select=document.getElementById(id);select.innerHTML=`<option value="">All</option>`+values.map(value=>`<option value="${esc(value)}">${esc(formatter(value))}</option>`).join("");select.addEventListener("change",renderCandidates);}
 function dynamicStatus(row){if(passes(row))return'<span class="result pass">meets selected limits</span>';if(!intrinsicPass(row))return`<span class="result fail">${esc(row.reason)}</span>`;return`<span class="result fail">${esc(failedChecks(row).join("; "))}</span>`;}
-function renderCandidates(){const proofs=document.getElementById("proofs-filter").value,leaf=document.getElementById("leaf-filter").value,workers=document.getElementById("workers-filter").value;const rows=DATA.candidates.filter(row=>(!proofs||row.proofs===Number(proofs))&&(!leaf||row.leafRate===Number(leaf))&&(!workers||row.workers===Number(workers)));document.getElementById("candidate-table").innerHTML=table([{label:"Proofs / root",numeric:true},{label:"Leaf WHIR rate"},{label:"Root WHIR rate"},{label:"Performance threads",numeric:true},{label:"Maximum input-to-root",numeric:true},{label:"Mean input-to-root",numeric:true},{label:"Average root interval",numeric:true},{label:"Peak RSS",numeric:true},{label:"Root proof",numeric:true},{label:"Selected limits"}],rows.map(row=>[row.proofs,rateLabel(row.leafRate),rateLabel(row.rootRate),row.workers,row.maxLatency==null?"—":`${fmt(row.maxLatency)} s`,row.meanLatency==null?"—":`${fmt(row.meanLatency)} s`,row.meanRootInterval==null?"—":`${fmt(row.meanRootInterval)} s`,row.peakRssGiB==null?"—":`${fmt(row.peakRssGiB,2)} GiB`,row.rootProofBytes==null?"—":`${fmt(row.rootProofBytes/1024,1)} KiB`,dynamicStatus(row)]));}
-function renderTree(selected){const note=document.getElementById("tree-note"),target=document.getElementById("tree-table");if(!selected||!selected.tree||!selected.tree.levels.length){note.textContent="";target.innerHTML=table([{label:"Result"}],[[`<span class="na">No selected tree.</span>`]]);return;}const levels=selected.tree.levels,single=levels.length===1,chain=[`${selected.proofs} leaf proofs`,...levels.map(level=>level.isRoot?"1 root":`${level.outputCount} parent proofs`)].join(" → ");note.textContent=single?`${chain}. The root time is the measured mean for the complete tree.`:`${chain}. The complete tree took ${fmt(selected.meanProvingSeconds)} s on average. Per-level timestamps were not recorded, so the level times are planner estimates.`;target.innerHTML=table([{label:"Level"},{label:"Input proofs",numeric:true},{label:"Nodes produced",numeric:true},{label:"Children per node"},{label:"WHIR rate"},{label:"Level time",numeric:true}],levels.map(level=>[level.isRoot?"Root":level.level,level.inputCount,level.outputCount,level.childCounts.join(" + "),`${rateLabel(level.childRate)} → ${rateLabel(level.parentRate)}`,single?`${fmt(selected.meanProvingSeconds)} s measured`:`${fmt(level.estimatedSeconds)} s estimated`]));}
+function renderCandidates(){const proofs=document.getElementById("proofs-filter").value,leaf=document.getElementById("leaf-filter").value,workers=document.getElementById("workers-filter").value;const rows=DATA.candidates.filter(row=>(!proofs||row.proofs===Number(proofs))&&(!leaf||row.leafRate===Number(leaf))&&(!workers||row.workers===Number(workers)));document.getElementById("candidate-table").innerHTML=table([{label:"Proofs / root",numeric:true},{label:"Leaf WHIR rate"},{label:"Root WHIR rate"},{label:"Performance threads",numeric:true},{label:"Maximum input-to-root",numeric:true},{label:"Mean input-to-root",numeric:true},{label:"Roots pending at next block",numeric:true},{label:"Peak RSS",numeric:true},{label:"Root proof",numeric:true},{label:"Selected limits"}],rows.map(row=>[row.proofs,rateLabel(row.leafRate),rateLabel(row.rootRate),row.workers,row.maxLatency==null?"—":`${fmt(row.maxLatency)} s`,row.meanLatency==null?"—":`${fmt(row.meanLatency)} s`,row.backlogAtNextBlock==null?"—":fmt(row.backlogAtNextBlock,0),row.peakRssGiB==null?"—":`${fmt(row.peakRssGiB,2)} GiB`,row.rootProofBytes==null?"—":`${fmt(row.rootProofBytes/1024,1)} KiB`,dynamicStatus(row)]));}
+function renderTree(selected){const note=document.getElementById("tree-note"),target=document.getElementById("tree-table");if(!selected||!selected.tree||!selected.tree.levels.length){note.textContent="";target.innerHTML=table([{label:"Result"}],[[`<span class="na">No selected tree.</span>`]]);return;}const levels=selected.tree.levels,single=levels.length===1,hasLevelEstimates=selected.tree.levelTimesEstimated!==false,chain=[`${selected.proofs} leaf proofs`,...levels.map(level=>level.isRoot?"1 root":`${level.outputCount} parent proofs`)].join(" → ");note.textContent=single?`${chain}. The root time is the measured mean for the complete tree.`:hasLevelEstimates?`${chain}. The complete tree took ${fmt(selected.meanProvingSeconds)} s on average. Per-level timestamps were not recorded, so the level times are planner estimates.`:`${chain}. The complete tree took ${fmt(selected.meanProvingSeconds)} s on average. The grouping matches artifacts with the recorded plan digest; per-level times are unavailable.`;target.innerHTML=table([{label:"Level"},{label:"Input proofs",numeric:true},{label:"Nodes produced",numeric:true},{label:"Children per node"},{label:"WHIR rate"},{label:"Level time",numeric:true}],levels.map(level=>[level.isRoot?"Root":level.level,level.inputCount,level.outputCount,level.childCounts.join(" + "),`${rateLabel(level.childRate)} → ${rateLabel(level.parentRate)}`,single?`${fmt(selected.meanProvingSeconds)} s measured`:hasLevelEstimates?`${fmt(level.estimatedSeconds)} s estimated`:`—`]));}
 function lineChart(target,series,options){const width=940,height=360,margin={top:22,right:28,bottom:54,left:72},innerW=width-margin.left-margin.right,innerH=height-margin.top-margin.bottom,xs=[...new Set(series.flatMap(item=>item.values.map(point=>point.x)))].sort((a,b)=>a-b),ys=series.flatMap(item=>item.values.map(point=>point.y)).filter(value=>value>0);if(options.reference>0)ys.push(options.reference);const minY=Math.max(.1,Math.min(...ys)*.72),maxY=Math.max(...ys)*1.18,logMin=Math.log10(minY),logMax=Math.log10(maxY),x=value=>margin.left+(xs.indexOf(value)/Math.max(1,xs.length-1))*innerW,y=value=>margin.top+(logMax-Math.log10(value))/(logMax-logMin)*innerH,powers=[];for(let power=Math.floor(logMin);power<=Math.ceil(logMax);power++)for(const factor of[1,2,5]){const value=factor*10**power;if(value>=minY&&value<=maxY)powers.push(value);}const yTicks=powers.filter((_,index)=>powers.length<=7||index%2===0);let svg=`<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(options.aria)}">`;for(const tick of yTicks)svg+=`<line class="grid" x1="${margin.left}" x2="${width-margin.right}" y1="${y(tick)}" y2="${y(tick)}"/><text class="axis-text" x="${margin.left-10}" y="${y(tick)+4}" text-anchor="end">${tick<10?fmt(tick,tick<1?1:0):Math.round(tick)}</text>`;for(const tick of xs)svg+=`<text class="axis-text" x="${x(tick)}" y="${height-margin.bottom+23}" text-anchor="middle">${tick}</text>`;svg+=`<line class="axis" x1="${margin.left}" x2="${width-margin.right}" y1="${height-margin.bottom}" y2="${height-margin.bottom}"/><line class="axis" x1="${margin.left}" x2="${margin.left}" y1="${margin.top}" y2="${height-margin.bottom}"/>`;if(options.reference>0)svg+=`<line class="deadline" x1="${margin.left}" x2="${width-margin.right}" y1="${y(options.reference)}" y2="${y(options.reference)}"/><text x="${width-margin.right-2}" y="${Math.max(margin.top+12,y(options.reference)-7)}" text-anchor="end" fill="var(--red)" font-size="12">Whole-root input-to-root limit ${fmt(options.reference,0)} s</text>`;series.forEach(item=>{const values=[...item.values].sort((a,b)=>xs.indexOf(a.x)-xs.indexOf(b.x));svg+=`<polyline points="${values.map(point=>`${x(point.x)},${y(point.y)}`).join(" ")}" fill="none" stroke="${item.color}" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>`;values.forEach(point=>{svg+=`<circle cx="${x(point.x)}" cy="${y(point.y)}" r="5" fill="var(--surface)" stroke="${item.color}" stroke-width="2"><title>${esc(item.label)} · ${point.x} child proofs · ${fmt(point.y)} s</title></circle>`;});});svg+=`<text class="axis-title" x="${margin.left+innerW/2}" y="${height-9}" text-anchor="middle">${esc(options.xTitle)}</text><text class="axis-title" transform="translate(17 ${margin.top+innerH/2}) rotate(-90)" text-anchor="middle">${esc(options.yTitle)}</text></svg>`;document.getElementById(target).innerHTML=svg;}
 function renderGeometry(){const rows=DATA.geometry.filter(row=>row.parentRate===1),rates=[...new Set(rows.map(row=>row.childRate))].sort((a,b)=>a-b),series=rates.map((rate,index)=>({label:`Child WHIR rate ${rateLabel(rate)}`,color:RATE_COLORS[index],values:rows.filter(row=>row.childRate===rate).map(row=>({x:row.arity,y:row.serviceSeconds}))}));document.getElementById("geometry-legend").innerHTML=series.map(item=>`<span><i class="swatch" style="background:${item.color}"></i>${item.label}</span>`).join("");lineChart("geometry-chart",series,{reference:state.deadline,xTitle:"Child proofs per parent",yTitle:"Mean proving time (seconds)",aria:"Representative parent proving time by arity and child WHIR rate"});}
 function setupTabs(){document.querySelectorAll('[role="tab"]').forEach(tab=>tab.addEventListener("click",()=>{document.querySelectorAll('[role="tab"]').forEach(other=>other.setAttribute("aria-selected",String(other===tab)));document.querySelectorAll('.tab-panel').forEach(panel=>panel.hidden=panel.id!==tab.getAttribute("aria-controls"));}));}
@@ -424,11 +586,18 @@ setHeader();setupControls();populateSelect("proofs-filter",[...new Set(DATA.cand
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True, type=Path, help="completed schema-2 benchmark directory")
+    parser.add_argument(
+        "--input",
+        required=True,
+        action="append",
+        type=Path,
+        help="schema-2 benchmark directory; repeat to merge compatible measurements",
+    )
     parser.add_argument("--output", required=True, type=Path, help="standalone HTML report path")
     parser.add_argument("--hardware-description", required=True, help="machine used for the benchmark")
     args = parser.parse_args()
-    payload = build_payload(args.input.resolve(), args.hardware_description)
+    input_dirs = [path.resolve() for path in args.input]
+    payload = build_payload(input_dirs, args.hardware_description)
     encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).replace("</", "<\\/")
     document = REPORT_HTML.replace("__REPORT_DATA__", encoded)
     args.output.parent.mkdir(parents=True, exist_ok=True)
