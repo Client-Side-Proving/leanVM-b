@@ -42,6 +42,46 @@ class BenchmarkRunnerTests(unittest.TestCase):
         self.assertEqual(runner.schema2_root_target(True), 1)
         self.assertEqual(runner.schema2_root_target(False), 6)
 
+    def test_native_root_validation_timings_are_reported_separately(self):
+        roots = [
+            {
+                "native_in_memory_verification_seconds": 1.0,
+                "native_deserialization_seconds": 2.0,
+                "native_roundtrip_verification_seconds": 3.0,
+                "native_validation_seconds": 6.0,
+            },
+            {
+                "native_in_memory_verification_seconds": 3.0,
+                "native_deserialization_seconds": 4.0,
+                "native_roundtrip_verification_seconds": 5.0,
+                "native_validation_seconds": 12.0,
+            },
+        ]
+        self.assertEqual(
+            runner.summarize_native_root_timings(roots),
+            {
+                "median_native_root_in_memory_verification_seconds": 2.0,
+                "max_native_root_in_memory_verification_seconds": 3.0,
+                "median_native_root_deserialization_seconds": 3.0,
+                "max_native_root_deserialization_seconds": 4.0,
+                "median_native_root_roundtrip_verification_seconds": 4.0,
+                "max_native_root_roundtrip_verification_seconds": 5.0,
+                "median_native_root_validation_seconds": 9.0,
+                "max_native_root_validation_seconds": 12.0,
+            },
+        )
+        self.assertEqual(
+            runner.native_root_timing_fields(roots[0]),
+            {
+                "native_root_in_memory_verification_seconds": 1.0,
+                "native_root_deserialization_seconds": 2.0,
+                "native_root_roundtrip_verification_seconds": 3.0,
+                "native_root_validation_seconds": 6.0,
+            },
+        )
+        self.assertNotIn("native_root_verify_seconds", runner.SCHEMA2_ROOT_FIELDS)
+        self.assertNotIn("median_native_root_verify_seconds", runner.SCHEMA2_CANDIDATE_FIELDS)
+
     def test_schema2_campaign_has_the_required_47_configurations(self):
         query = json.loads((ROOT / "privacy-pool-withdrawal-screening.json").read_text())
         configurations = runner.schema2_campaign_configurations(query, [8, 4, 2, 1])
@@ -87,6 +127,42 @@ class BenchmarkRunnerTests(unittest.TestCase):
     def test_worker_order_is_preserved_by_deduplication(self):
         values = list(dict.fromkeys(int(value) for value in "8,4,8,2,1".split(",")))
         self.assertEqual(values, [8, 4, 2, 1])
+
+    def test_schema2_plan_filenames_include_the_worker_count(self):
+        four_workers = runner.schema2_plan_filename("scaling", 16, 4, 1, 4)
+        two_workers = runner.schema2_plan_filename("scaling", 16, 4, 1, 2)
+        self.assertEqual(four_workers, "scaling-16-4-1-w4.json")
+        self.assertEqual(two_workers, "scaling-16-4-1-w2.json")
+        self.assertNotEqual(four_workers, two_workers)
+
+        query = json.loads((ROOT / "privacy-pool-withdrawal-screening.json").read_text())
+        configurations = runner.schema2_campaign_configurations(query, [8, 4, 2, 1], selected_rate=4)
+        filenames = [
+            runner.schema2_plan_filename(phase, inputs, leaf_rate, root_rate, workers)
+            for inputs, leaf_rate, workers, root_rate, phase in configurations
+        ]
+        self.assertEqual(len(filenames), 47)
+        self.assertEqual(len(set(filenames)), len(filenames))
+
+    def test_schema2_plan_loader_checks_the_recorded_digest(self):
+        plan = {
+            "leaf_count": 16,
+            "leaf_log_inv_rate": 4,
+            "root_log_inv_rate": 1,
+            "levels": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "scaling-16-4-1-w4.json"
+            path.write_text(json.dumps(plan), encoding="utf-8")
+            expected_digest = runner.schema2_plan_digest(plan)
+            loaded, actual_digest = runner.load_schema2_plan(path, expected_digest)
+            self.assertEqual(loaded, plan)
+            self.assertEqual(actual_digest, expected_digest)
+
+            plan["leaf_count"] = 32
+            path.write_text(json.dumps(plan), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "plan digest mismatch"):
+                runner.load_schema2_plan(path, expected_digest)
 
     def test_schema1_shape_remains_supported(self):
         query = json.loads((ROOT / "recursion-benchmark-example.json").read_text())
