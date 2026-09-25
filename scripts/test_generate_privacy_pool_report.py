@@ -125,11 +125,34 @@ class PrivacyPoolReportTests(unittest.TestCase):
     def test_dashboard_admission_uses_deadline_and_backlog(self):
         self.assertIn("row.maxLatency<=state.deadline", report.REPORT_HTML)
         self.assertIn("row.backlogAtNextBlock===0", report.REPORT_HTML)
+        self.assertIn("Unfinished roots after six block arrivals", report.REPORT_HTML)
+        self.assertNotIn("Roots pending at next block arrival", report.REPORT_HTML)
         self.assertNotIn(
             "row.meanRootInterval<=DATA.blockPeriodSeconds",
             report.REPORT_HTML,
         )
         self.assertNotIn("Average interval between roots", report.REPORT_HTML)
+
+    def test_peak_rss_axis_uses_power_of_two_ticks(self):
+        self.assertIn('digits:2,logarithmic:2', report.REPORT_HTML)
+        self.assertIn("metric.logarithmic===2", report.REPORT_HTML)
+        self.assertIn("Math.log2", report.REPORT_HTML)
+        self.assertIn("2**(minPower+index)", report.REPORT_HTML)
+        self.assertIn('metric.key==="memory"?fmt(value,0)', report.REPORT_HTML)
+        self.assertIn("log₂ scale", report.REPORT_HTML)
+
+    def test_resource_chart_colors_distinguish_overall_feasibility(self):
+        self.assertIn("Meets every selected limit", report.REPORT_HTML)
+        self.assertIn("Exceeds this chart's limit", report.REPORT_HTML)
+        self.assertIn(
+            "Within this chart's limit, exceeds another selected limit",
+            report.REPORT_HTML,
+        )
+        self.assertIn("feasible=passes(row)", report.REPORT_HTML)
+        self.assertIn(
+            "feasible?'var(--green)':within?'var(--muted)':'var(--red)'",
+            report.REPORT_HTML,
+        )
 
 
 if __name__ == "__main__":

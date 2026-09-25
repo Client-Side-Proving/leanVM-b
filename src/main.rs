@@ -129,6 +129,11 @@ enum Command {
         root_log_inv_rate: usize,
         #[arg(long, default_value_t = 1)]
         performance_workers: usize,
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
+        )]
+        max_job_rss_bytes: Option<u64>,
     },
     /// One measured application-query point, launched by the Python runner.
     #[command(hide = true)]
@@ -172,6 +177,12 @@ enum Command {
         #[arg(long, default_value = "2000000")]
         n: usize,
     },
+}
+
+fn apply_max_job_rss_bytes(job_costs: &mut Vec<rec_aggregation::query::JobCost>, max_job_rss_bytes: Option<u64>) {
+    if let Some(max_job_rss_bytes) = max_job_rss_bytes {
+        job_costs.retain(|cost| cost.peak_rss_bytes <= max_job_rss_bytes);
+    }
 }
 
 fn main() {
@@ -271,6 +282,7 @@ fn main() {
             leaf_log_inv_rate,
             root_log_inv_rate,
             performance_workers,
+            max_job_rss_bytes,
         } => {
             let loaded = rec_aggregation::BenchmarkQuery::from_path(query).expect("recursion benchmark query is valid");
             let costs_text = std::fs::read_to_string(costs).expect("capacity records are readable");
@@ -382,6 +394,7 @@ fn main() {
                     job_costs.push(modeled);
                 }
             }
+            apply_max_job_rss_bytes(&mut job_costs, *max_job_rss_bytes);
             let plan = rec_aggregation::query::plan_tree_with_rate_pairs(
                 *inputs_per_root,
                 *leaf_log_inv_rate,
@@ -482,5 +495,84 @@ fn main() {
     // buffers meant to be arena-backed are.
     if std::env::var_os("ZK_ALLOC_STATS").is_some() {
         eprintln!("{}", zk_alloc::stats());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn privacy_pool_plan_accepts_maximum_parent_job_rss() {
+        let cli = Cli::try_parse_from([
+            "leanvm-b",
+            "privacy-pool-plan",
+            "--query",
+            "query.json",
+            "--costs",
+            "costs.json",
+            "--inputs-per-root",
+            "12",
+            "--leaf-log-inv-rate",
+            "4",
+            "--root-log-inv-rate",
+            "1",
+            "--performance-workers",
+            "4",
+            "--max-job-rss-bytes",
+            "17179869184",
+        ])
+        .unwrap();
+
+        let Command::PrivacyPoolPlan { max_job_rss_bytes, .. } = cli.command else {
+            panic!("expected privacy-pool-plan command");
+        };
+        assert_eq!(max_job_rss_bytes, Some(17_179_869_184));
+    }
+
+    #[test]
+    fn privacy_pool_plan_rejects_zero_maximum_parent_job_rss() {
+        let result = Cli::try_parse_from([
+            "leanvm-b",
+            "privacy-pool-plan",
+            "--query",
+            "query.json",
+            "--costs",
+            "costs.json",
+            "--inputs-per-root",
+            "12",
+            "--leaf-log-inv-rate",
+            "4",
+            "--root-log-inv-rate",
+            "1",
+            "--max-job-rss-bytes",
+            "0",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn maximum_parent_job_rss_is_inclusive() {
+        let mut costs = [99, 100, 101]
+            .into_iter()
+            .map(|peak_rss_bytes| rec_aggregation::query::JobCost {
+                child_count: 2,
+                child_log_inv_rate: 4,
+                parent_log_inv_rate: 1,
+                service_seconds: 1.0,
+                peak_rss_bytes,
+                output_bytes: 1,
+                directly_measured: true,
+                performance_workers: 4,
+            })
+            .collect();
+
+        apply_max_job_rss_bytes(&mut costs, Some(100));
+
+        assert_eq!(
+            costs.iter().map(|cost| cost.peak_rss_bytes).collect::<Vec<_>>(),
+            [99, 100]
+        );
     }
 }
